@@ -119,6 +119,118 @@ impl GeneratedImage {
     }
 }
 
+/// Weapon data from YAML
+#[derive(Deserialize, Debug, Clone)]
+struct Weapon {
+    name: String,
+    damage: String,
+    modifier: i32,
+}
+
+/// Character data from YAML config
+#[derive(Deserialize, Debug, Clone)]
+struct CharacterConfig {
+    name: String,
+    #[serde(default)]
+    dead: bool,
+    class: String,
+    armor_class: i32,
+    hit_points: i32,
+    health: i32,
+    token_representation: String,
+    weapons: Vec<Weapon>,
+    current_weapon: String,
+}
+
+/// Characters config file structure
+#[derive(Deserialize, Debug)]
+struct CharactersConfig {
+    characters: Vec<CharacterConfig>,
+}
+
+/// Runtime character state (includes position and visibility)
+#[derive(Clone)]
+struct Character {
+    config: CharacterConfig,
+    /// Grid position (column, row)
+    grid_pos: (u32, u32),
+    /// Whether the character is visible on the board
+    visible: bool,
+    /// Loaded token texture
+    token_texture: Option<egui::TextureHandle>,
+    /// Token image data
+    token_image: Option<egui::ColorImage>,
+}
+
+impl Character {
+    fn new(config: CharacterConfig) -> Self {
+        // Try to load token image
+        let token_path = format!("assets/token_reps/{}", config.token_representation);
+        let token_image = Self::load_token_image(&token_path);
+        
+        Self {
+            config,
+            grid_pos: (0, 0),
+            visible: true,
+            token_texture: None,
+            token_image,
+        }
+    }
+    
+    fn load_token_image(path: &str) -> Option<egui::ColorImage> {
+        let path = std::path::Path::new(path);
+        if !path.exists() {
+            log::warn!("Token image not found at {:?}", path);
+            return None;
+        }
+        
+        match image::open(path) {
+            Ok(img) => {
+                let rgba = img.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let pixels = rgba.into_raw();
+                log::info!("Loaded token image: {:?}", path);
+                Some(egui::ColorImage::from_rgba_unmultiplied(size, &pixels))
+            }
+            Err(e) => {
+                log::error!("Failed to load token image {:?}: {}", path, e);
+                None
+            }
+        }
+    }
+    
+    /// Health percentage (0.0 - 1.0)
+    fn health_percentage(&self) -> f32 {
+        if self.config.hit_points <= 0 {
+            return 0.0;
+        }
+        (self.config.health as f32 / self.config.hit_points as f32).clamp(0.0, 1.0)
+    }
+}
+
+/// Load characters from YAML config file
+fn load_characters() -> Vec<Character> {
+    let config_path = PathBuf::from("../config/characters.yaml");
+    
+    let content = match fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Failed to read characters config: {}", e);
+            return Vec::new();
+        }
+    };
+    
+    let config: CharactersConfig = match serde_yaml::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("Failed to parse characters config: {}", e);
+            return Vec::new();
+        }
+    };
+    
+    config.characters.into_iter().map(Character::new).collect()
+}
+
 /// Generate an image using Gemini API
 fn generate_image_with_gemini(api_token: &str, prompt: &str) -> Result<Vec<u8>, String> {
     // Use Gemini image generation model
@@ -1081,6 +1193,8 @@ struct FingerTrackerApp {
     show_grid: bool,
     /// Number of rows in the grid (5-14)
     grid_rows: u32,
+    /// Characters on the board
+    characters: Arc<Mutex<Vec<Character>>>,
 }
 
 impl FingerTrackerApp {
@@ -1105,6 +1219,16 @@ impl FingerTrackerApp {
         // Load existing generated images from assets/generated folder
         let generated_images = Self::load_existing_generated_images();
         
+        // Load characters and position them in the middle of the grid
+        let mut characters = load_characters();
+        let default_grid_rows = 10u32;
+        let middle_row = default_grid_rows / 2;
+        let middle_col = default_grid_rows / 2; // Approximate middle column
+        for (i, char) in characters.iter_mut().enumerate() {
+            // Place characters adjacent to each other in the middle
+            char.grid_pos = (middle_col + i as u32, middle_row);
+        }
+        
         Self {
             state,
             texture: None,
@@ -1123,7 +1247,8 @@ impl FingerTrackerApp {
             generated_images: Arc::new(Mutex::new(generated_images)),
             selected_image_index: Arc::new(Mutex::new(None)),
             show_grid: false,
-            grid_rows: 10,
+            grid_rows: default_grid_rows,
+            characters: Arc::new(Mutex::new(characters)),
         }
     }
     
@@ -1270,6 +1395,7 @@ impl eframe::App for FingerTrackerApp {
             let selected_image_path = Arc::new(Mutex::new(None::<PathBuf>));
             let show_grid = Arc::new(Mutex::new(self.show_grid));
             let grid_rows = Arc::new(Mutex::new(self.grid_rows));
+            let characters = self.characters.clone();
 
             // Clone Arcs for the closure
             let show_camera_feed_c = show_camera_feed.clone();
@@ -1288,6 +1414,7 @@ impl eframe::App for FingerTrackerApp {
             let selected_image_path_c = selected_image_path.clone();
             let show_grid_c = show_grid.clone();
             let grid_rows_c = grid_rows.clone();
+            let characters_c = characters.clone();
 
             ctx.show_viewport_immediate(
                 options_viewport_id(),
@@ -1336,6 +1463,61 @@ impl eframe::App for FingerTrackerApp {
                             {
                                 let mut rows = grid_rows_c.lock().unwrap();
                                 ui.add(egui::Slider::new(&mut *rows, 5..=14).text("Grid Rows"));
+                            }
+
+                            ui.separator();
+                            ui.heading("🎭 Characters");
+                            {
+                                let mut chars = characters_c.lock().unwrap();
+                                if chars.is_empty() {
+                                    ui.colored_label(egui::Color32::GRAY, "No characters loaded");
+                                    ui.small("Add characters to config/characters.yaml");
+                                } else {
+                                    for char in chars.iter_mut() {
+                                        ui.horizontal(|ui| {
+                                            // Visibility checkbox
+                                            ui.checkbox(&mut char.visible, "");
+                                            
+                                            // Token thumbnail
+                                            let thumb_size = egui::vec2(32.0, 32.0);
+                                            if let Some(ref token_img) = char.token_image {
+                                                let texture = ctx.load_texture(
+                                                    format!("char_thumb_{}", char.config.name),
+                                                    token_img.clone(),
+                                                    egui::TextureOptions::LINEAR,
+                                                );
+                                                let (rect, _) = ui.allocate_exact_size(thumb_size, egui::Sense::hover());
+                                                ui.painter().image(
+                                                    texture.id(),
+                                                    rect,
+                                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                                    egui::Color32::WHITE,
+                                                );
+                                            } else {
+                                                // Placeholder if no token
+                                                let (rect, _) = ui.allocate_exact_size(thumb_size, egui::Sense::hover());
+                                                ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(60));
+                                                ui.painter().text(
+                                                    rect.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    &char.config.name.chars().next().unwrap_or('?').to_string(),
+                                                    egui::FontId::default(),
+                                                    egui::Color32::WHITE,
+                                                );
+                                            }
+                                            
+                                            // Character info
+                                            ui.vertical(|ui| {
+                                                ui.label(&char.config.name);
+                                                ui.small(format!("{} - HP: {}/{}", 
+                                                    char.config.class, 
+                                                    char.config.health, 
+                                                    char.config.hit_points));
+                                            });
+                                        });
+                                        ui.add_space(2.0);
+                                    }
+                                }
                             }
 
                             ui.separator();
@@ -2248,6 +2430,103 @@ impl eframe::App for FingerTrackerApp {
                                 stroke,
                             );
                         }
+                    }
+                }
+                
+                // Draw characters on the grid
+                {
+                    let cell_size = rect.height() / self.grid_rows as f32;
+                    let mut chars = self.characters.lock().unwrap();
+                    
+                    for char in chars.iter_mut() {
+                        if !char.visible {
+                            continue;
+                        }
+                        
+                        let (col, row) = char.grid_pos;
+                        
+                        // Calculate cell position
+                        let cell_x = rect.min.x + col as f32 * cell_size;
+                        let cell_y = rect.min.y + row as f32 * cell_size;
+                        
+                        // Token size (slightly smaller than cell)
+                        let token_margin = cell_size * 0.1;
+                        let token_size = cell_size - token_margin * 2.0;
+                        let token_rect = egui::Rect::from_min_size(
+                            egui::pos2(cell_x + token_margin, cell_y + token_margin),
+                            egui::vec2(token_size, token_size),
+                        );
+                        
+                        // Draw token image or placeholder
+                        if let Some(ref token_img) = char.token_image {
+                            // Create/update texture
+                            let texture = char.token_texture.get_or_insert_with(|| {
+                                ctx.load_texture(
+                                    format!("token_{}", char.config.name),
+                                    token_img.clone(),
+                                    egui::TextureOptions::LINEAR,
+                                )
+                            });
+                            
+                            ui.painter().image(
+                                texture.id(),
+                                token_rect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+                        } else {
+                            // Draw placeholder circle with initial
+                            ui.painter().circle_filled(
+                                token_rect.center(),
+                                token_size / 2.0,
+                                egui::Color32::from_rgb(100, 100, 150),
+                            );
+                            ui.painter().text(
+                                token_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                &char.config.name.chars().next().unwrap_or('?').to_string(),
+                                egui::FontId::proportional(token_size * 0.5),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                        
+                        // Draw health bar on top of the token
+                        let health_bar_height = cell_size * 0.08;
+                        let health_bar_y = cell_y + token_margin - health_bar_height - 2.0;
+                        let health_bar_rect = egui::Rect::from_min_size(
+                            egui::pos2(cell_x + token_margin, health_bar_y),
+                            egui::vec2(token_size, health_bar_height),
+                        );
+                        
+                        // Health bar background (dark red)
+                        ui.painter().rect_filled(
+                            health_bar_rect,
+                            2.0,
+                            egui::Color32::from_rgb(60, 20, 20),
+                        );
+                        
+                        // Health bar fill (green to red based on health)
+                        let health_pct = char.health_percentage();
+                        let health_color = if health_pct > 0.5 {
+                            egui::Color32::from_rgb(50, 200, 50)
+                        } else if health_pct > 0.25 {
+                            egui::Color32::from_rgb(200, 200, 50)
+                        } else {
+                            egui::Color32::from_rgb(200, 50, 50)
+                        };
+                        
+                        let health_fill_rect = egui::Rect::from_min_size(
+                            health_bar_rect.min,
+                            egui::vec2(token_size * health_pct, health_bar_height),
+                        );
+                        ui.painter().rect_filled(health_fill_rect, 2.0, health_color);
+                        
+                        // Health bar border
+                        ui.painter().rect_stroke(
+                            health_bar_rect,
+                            2.0,
+                            egui::Stroke::new(1.0, egui::Color32::BLACK),
+                        );
                     }
                 }
                 
