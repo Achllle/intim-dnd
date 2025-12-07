@@ -81,6 +81,44 @@ enum ImageGenStatus {
     Error(String),
 }
 
+/// A generated image entry for the gallery
+#[derive(Clone)]
+struct GeneratedImage {
+    /// Path to the image file
+    path: PathBuf,
+    /// The prompt used to generate this image
+    prompt: String,
+}
+
+impl GeneratedImage {
+    fn new(path: PathBuf, prompt: String) -> Self {
+        Self {
+            path,
+            prompt,
+        }
+    }
+    
+    /// Generate a filename from a prompt (sanitized)
+    fn filename_from_prompt(prompt: &str) -> String {
+        let sanitized: String = prompt
+            .chars()
+            .take(40)
+            .map(|c| if c.is_alphanumeric() || c == ' ' { c } else { '_' })
+            .collect::<String>()
+            .trim()
+            .replace(' ', "_")
+            .to_lowercase();
+        
+        // Add timestamp for uniqueness
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        
+        format!("{}_{}.png", sanitized, timestamp)
+    }
+}
+
 /// Generate an image using Gemini API
 fn generate_image_with_gemini(api_token: &str, prompt: &str) -> Result<Vec<u8>, String> {
     // Use Gemini image generation model
@@ -1035,6 +1073,10 @@ struct FingerTrackerApp {
     image_gen_prompt: String,
     /// Image generation status
     image_gen_status: Arc<Mutex<ImageGenStatus>>,
+    /// Gallery of generated images (last 5)
+    generated_images: Arc<Mutex<Vec<GeneratedImage>>>,
+    /// Currently selected image index in gallery
+    selected_image_index: Arc<Mutex<Option<usize>>>,
 }
 
 impl FingerTrackerApp {
@@ -1056,6 +1098,9 @@ impl FingerTrackerApp {
         // Load Gemini API token
         let gemini_api_token = load_gemini_api_token();
         
+        // Load existing generated images from assets/generated folder
+        let generated_images = Self::load_existing_generated_images();
+        
         Self {
             state,
             texture: None,
@@ -1071,6 +1116,8 @@ impl FingerTrackerApp {
             gemini_api_token,
             image_gen_prompt: String::new(),
             image_gen_status: Arc::new(Mutex::new(ImageGenStatus::Idle)),
+            generated_images: Arc::new(Mutex::new(generated_images)),
+            selected_image_index: Arc::new(Mutex::new(None)),
         }
     }
     
@@ -1097,22 +1144,77 @@ impl FingerTrackerApp {
         }
     }
     
-    /// Reload background image (after generation)
-    fn reload_background(&mut self) {
-        self.background_image = Self::load_background_image("assets/generated_background.png");
-        if self.background_image.is_none() {
-            // Fall back to original if generated doesn't exist
-            self.background_image = Self::load_background_image("assets/cave-map.jpg");
-        }
-        // Clear the texture so it gets recreated with new image
-        self.background_texture = None;
-    }
-    
     /// Load default background image
     fn load_default_background(&mut self) {
         self.background_image = Self::load_background_image("assets/cave-map.jpg");
         // Clear the texture so it gets recreated with new image
         self.background_texture = None;
+    }
+    
+    /// Load a specific image as background
+    fn load_image_as_background(&mut self, path: &std::path::Path) {
+        self.background_image = Self::load_background_image(path.to_str().unwrap_or(""));
+        // Clear the texture so it gets recreated with new image
+        self.background_texture = None;
+    }
+    
+    /// Load existing generated images from the assets/generated folder
+    fn load_existing_generated_images() -> Vec<GeneratedImage> {
+        let generated_dir = PathBuf::from("assets/generated");
+        let mut images = Vec::new();
+        
+        if generated_dir.exists() {
+            if let Ok(entries) = fs::read_dir(&generated_dir) {
+                let mut entries: Vec<_> = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.path().extension()
+                            .map(|ext| ext == "png")
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                
+                // Sort by modification time (newest first)
+                entries.sort_by(|a, b| {
+                    let a_time = a.metadata().and_then(|m| m.modified()).ok();
+                    let b_time = b.metadata().and_then(|m| m.modified()).ok();
+                    b_time.cmp(&a_time)
+                });
+                
+                // Take only the last 5
+                for entry in entries.into_iter().take(5) {
+                    let path = entry.path();
+                    // Extract prompt from filename (remove timestamp and extension)
+                    let prompt = path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| {
+                            // Remove the timestamp suffix (last part after _)
+                            if let Some(idx) = s.rfind('_') {
+                                s[..idx].replace('_', " ")
+                            } else {
+                                s.replace('_', " ")
+                            }
+                        })
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    
+                    images.push(GeneratedImage::new(path, prompt));
+                }
+            }
+        }
+        
+        log::info!("Loaded {} existing generated images", images.len());
+        images
+    }
+    
+    /// Add a new generated image to the gallery
+    fn add_generated_image(images: &mut Vec<GeneratedImage>, path: PathBuf, prompt: String) {
+        // Add new image at the beginning
+        images.insert(0, GeneratedImage::new(path, prompt));
+        
+        // Keep only the last 5 images
+        while images.len() > 5 {
+            images.pop();
+        }
     }
 }
 
@@ -1155,8 +1257,11 @@ impl eframe::App for FingerTrackerApp {
             let image_gen_prompt = Arc::new(Mutex::new(self.image_gen_prompt.clone()));
             let image_gen_status = self.image_gen_status.clone();
             let gemini_api_token = self.gemini_api_token.clone();
-            let reload_background = Arc::new(Mutex::new(false));
             let use_default_background = Arc::new(Mutex::new(false));
+            let generated_images = self.generated_images.clone();
+            let selected_image_index = self.selected_image_index.clone();
+            let load_selected_image = Arc::new(Mutex::new(false));
+            let selected_image_path = Arc::new(Mutex::new(None::<PathBuf>));
 
             // Clone Arcs for the closure
             let show_camera_feed_c = show_camera_feed.clone();
@@ -1168,8 +1273,11 @@ impl eframe::App for FingerTrackerApp {
             let show_options_c = show_options.clone();
             let image_gen_prompt_c = image_gen_prompt.clone();
             let image_gen_status_c = image_gen_status.clone();
-            let reload_background_c = reload_background.clone();
             let use_default_background_c = use_default_background.clone();
+            let generated_images_c = generated_images.clone();
+            let selected_image_index_c = selected_image_index.clone();
+            let load_selected_image_c = load_selected_image.clone();
+            let selected_image_path_c = selected_image_path.clone();
 
             ctx.show_viewport_immediate(
                 options_viewport_id(),
@@ -1695,6 +1803,7 @@ impl eframe::App for FingerTrackerApp {
                             // Button to use default background
                             if ui.button("🗺️ Use Default Background").clicked() {
                                 *use_default_background_c.lock().unwrap() = true;
+                                *selected_image_index_c.lock().unwrap() = None;
                             }
                             
                             ui.add_space(8.0);
@@ -1723,24 +1832,48 @@ impl eframe::App for FingerTrackerApp {
                                         let prompt = image_gen_prompt_c.lock().unwrap().clone();
                                         let can_generate = !prompt.trim().is_empty();
                                         
-                                        if ui.add_enabled(can_generate, egui::Button::new("🖼️ Generate Background")).clicked() {
+                                        if ui.add_enabled(can_generate, egui::Button::new("🖼️ Generate Image")).clicked() {
                                             // Start generation in background thread
                                             let token = gemini_api_token.clone().unwrap();
                                             let status_clone = image_gen_status_c.clone();
-                                            let reload_clone = reload_background_c.clone();
+                                            let images_clone = generated_images_c.clone();
+                                            let selected_clone = selected_image_index_c.clone();
+                                            let prompt_for_thread = prompt.clone();
                                             
                                             *status_clone.lock().unwrap() = ImageGenStatus::Generating;
                                             
                                             thread::spawn(move || {
-                                                match generate_image_with_gemini(&token, &prompt) {
+                                                match generate_image_with_gemini(&token, &prompt_for_thread) {
                                                     Ok(image_bytes) => {
-                                                        // Save to assets folder
-                                                        let save_path = "assets/generated_background.png";
-                                                        match fs::write(save_path, &image_bytes) {
+                                                        // Create generated folder if it doesn't exist
+                                                        let generated_dir = PathBuf::from("assets/generated");
+                                                        if let Err(e) = fs::create_dir_all(&generated_dir) {
+                                                            *status_clone.lock().unwrap() = ImageGenStatus::Error(format!("Failed to create folder: {}", e));
+                                                            return;
+                                                        }
+                                                        
+                                                        // Generate unique filename from prompt
+                                                        let filename = GeneratedImage::filename_from_prompt(&prompt_for_thread);
+                                                        let save_path = generated_dir.join(&filename);
+                                                        
+                                                        match fs::write(&save_path, &image_bytes) {
                                                             Ok(_) => {
-                                                                log::info!("Saved generated image to {}", save_path);
-                                                                *status_clone.lock().unwrap() = ImageGenStatus::Success(save_path.to_string());
-                                                                *reload_clone.lock().unwrap() = true;
+                                                                log::info!("Saved generated image to {:?}", save_path);
+                                                                
+                                                                // Add to gallery
+                                                                let mut images = images_clone.lock().unwrap();
+                                                                FingerTrackerApp::add_generated_image(
+                                                                    &mut images,
+                                                                    save_path.clone(),
+                                                                    prompt_for_thread.clone()
+                                                                );
+                                                                
+                                                                // Select the newly generated image
+                                                                *selected_clone.lock().unwrap() = Some(0);
+                                                                
+                                                                *status_clone.lock().unwrap() = ImageGenStatus::Success(
+                                                                    save_path.to_string_lossy().to_string()
+                                                                );
                                                             }
                                                             Err(e) => {
                                                                 *status_clone.lock().unwrap() = ImageGenStatus::Error(format!("Failed to save: {}", e));
@@ -1760,16 +1893,11 @@ impl eframe::App for FingerTrackerApp {
                                             ui.label("Generating image...");
                                         });
                                     }
-                                    ImageGenStatus::Success(path) => {
-                                        ui.colored_label(egui::Color32::GREEN, format!("✓ Image saved to {}", path));
-                                        ui.horizontal(|ui| {
-                                            if ui.button("🖼️ Use as Background").clicked() {
-                                                *reload_background_c.lock().unwrap() = true;
-                                            }
-                                            if ui.button("Generate Another").clicked() {
-                                                *image_gen_status_c.lock().unwrap() = ImageGenStatus::Idle;
-                                            }
-                                        });
+                                    ImageGenStatus::Success(_path) => {
+                                        ui.colored_label(egui::Color32::GREEN, "✓ Image generated!");
+                                        if ui.button("Generate Another").clicked() {
+                                            *image_gen_status_c.lock().unwrap() = ImageGenStatus::Idle;
+                                        }
                                     }
                                     ImageGenStatus::Error(err) => {
                                         ui.colored_label(egui::Color32::RED, format!("✗ Error: {}", err));
@@ -1779,6 +1907,104 @@ impl eframe::App for FingerTrackerApp {
                                     }
                                 }
                             }
+                            
+                            // Image Gallery
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.heading("📁 Generated Images");
+                            
+                            let images = generated_images_c.lock().unwrap();
+                            let mut selected_idx = selected_image_index_c.lock().unwrap();
+                            
+                            if images.is_empty() {
+                                ui.colored_label(egui::Color32::GRAY, "No generated images yet");
+                            } else {
+                                ui.label(format!("Showing last {} images:", images.len()));
+                                
+                                // Gallery grid
+                                ui.horizontal_wrapped(|ui| {
+                                    for (idx, img) in images.iter().enumerate() {
+                                        let is_selected = *selected_idx == Some(idx);
+                                        let thumb_size = egui::vec2(60.0, 60.0);
+                                        
+                                        // Create a frame for selection highlight
+                                        let frame_color = if is_selected {
+                                            egui::Color32::from_rgb(100, 200, 100)
+                                        } else {
+                                            egui::Color32::from_gray(60)
+                                        };
+                                        
+                                        let response = egui::Frame::none()
+                                            .stroke(egui::Stroke::new(if is_selected { 3.0 } else { 1.0 }, frame_color))
+                                            .inner_margin(2.0)
+                                            .show(ui, |ui| {
+                                                // Try to load and display thumbnail
+                                                if let Ok(img_data) = image::open(&img.path) {
+                                                    let thumb = img_data.thumbnail(60, 60);
+                                                    let rgba = thumb.to_rgba8();
+                                                    let size = [rgba.width() as usize, rgba.height() as usize];
+                                                    let pixels = rgba.into_raw();
+                                                    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                                                    
+                                                    let texture = ctx.load_texture(
+                                                        format!("thumb_{}", idx),
+                                                        color_image,
+                                                        egui::TextureOptions::LINEAR,
+                                                    );
+                                                    
+                                                    let (rect, response) = ui.allocate_exact_size(thumb_size, egui::Sense::click());
+                                                    ui.painter().image(
+                                                        texture.id(),
+                                                        rect,
+                                                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                                        egui::Color32::WHITE,
+                                                    );
+                                                    response
+                                                } else {
+                                                    // Show placeholder if image can't be loaded
+                                                    let (rect, response) = ui.allocate_exact_size(thumb_size, egui::Sense::click());
+                                                    ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(40));
+                                                    ui.painter().text(
+                                                        rect.center(),
+                                                        egui::Align2::CENTER_CENTER,
+                                                        "?",
+                                                        egui::FontId::default(),
+                                                        egui::Color32::WHITE,
+                                                    );
+                                                    response
+                                                }
+                                            });
+                                        
+                                        // Handle click to select
+                                        if response.inner.clicked() {
+                                            *selected_idx = Some(idx);
+                                        }
+                                        
+                                        // Tooltip with prompt
+                                        response.response.on_hover_text(&img.prompt);
+                                    }
+                                });
+                                
+                                // Show selected image info and actions
+                                if let Some(idx) = *selected_idx {
+                                    if idx < images.len() {
+                                        ui.add_space(4.0);
+                                        ui.group(|ui| {
+                                            let img = &images[idx];
+                                            ui.label(format!("Selected: {}", img.prompt));
+                                            
+                                            ui.horizontal(|ui| {
+                                                if ui.button("🖼️ Display as Background").clicked() {
+                                                    *selected_image_path_c.lock().unwrap() = Some(img.path.clone());
+                                                    *load_selected_image_c.lock().unwrap() = true;
+                                                }
+                                            });
+                                        });
+                                    }
+                                }
+                            }
+                            drop(images);
+                            drop(selected_idx);
 
                             ui.separator();
                             ui.heading("Status");
@@ -1815,16 +2041,18 @@ impl eframe::App for FingerTrackerApp {
             self.show_options_window = *show_options.lock().unwrap();
             self.image_gen_prompt = image_gen_prompt.lock().unwrap().clone();
             
-            // Check if we need to reload the background image
-            if *reload_background.lock().unwrap() {
-                *reload_background.lock().unwrap() = false;
-                self.reload_background();
-            }
-            
             // Check if we need to use the default background
             if *use_default_background.lock().unwrap() {
                 *use_default_background.lock().unwrap() = false;
                 self.load_default_background();
+            }
+            
+            // Check if we need to load a selected image from the gallery
+            if *load_selected_image.lock().unwrap() {
+                *load_selected_image.lock().unwrap() = false;
+                if let Some(path) = selected_image_path.lock().unwrap().take() {
+                    self.load_image_as_background(&path);
+                }
             }
         }
 
