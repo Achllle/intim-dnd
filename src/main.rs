@@ -1,3 +1,5 @@
+mod hand_tracker;
+
 use anyhow::Result;
 use eframe::egui;
 use nalgebra::{Matrix3, Vector3};
@@ -149,31 +151,6 @@ fn load_camera_roi() -> Option<CameraRoi> {
     }
 }
 
-/// Finger detection parameters (adjust based on skin tone and lighting)
-#[derive(Clone)]
-struct FingerDetectionParams {
-    /// HSV lower bound for skin detection
-    hsv_lower: [u8; 3],
-    /// HSV upper bound for skin detection
-    hsv_upper: [u8; 3],
-    /// Minimum contour area to be considered a finger
-    min_contour_area: f64,
-    /// Gaussian blur kernel size
-    blur_size: i32,
-}
-
-impl Default for FingerDetectionParams {
-    fn default() -> Self {
-        Self {
-            // Typical skin tone HSV range (may need adjustment for your lighting/skin)
-            hsv_lower: [0, 30, 60],
-            hsv_upper: [20, 150, 255],
-            min_contour_area: 1500.0,
-            blur_size: 5,
-        }
-    }
-}
-
 /// Calibration state machine
 #[derive(Clone, PartialEq)]
 enum CalibrationState {
@@ -233,8 +210,6 @@ struct SharedState {
     finger_tip_projector: Option<(f32, f32)>,
     /// Homography matrix (camera -> projector)
     homography: Matrix3<f64>,
-    /// Detection parameters
-    params: FingerDetectionParams,
     /// Camera running flag
     running: bool,
     /// Calibration data
@@ -250,6 +225,8 @@ struct SharedState {
     calibration_brightness_threshold: u8,
     /// Camera region of interest (computed from calibration corner points)
     camera_roi: Option<CameraRoi>,
+    /// Hand landmarks for visualization (when using ML detection)
+    hand_landmarks: Option<Vec<(f32, f32)>>,
 }
 
 impl Default for CalibrationData {
@@ -339,7 +316,6 @@ impl SharedState {
             finger_tip_camera: None,
             finger_tip_projector: None,
             homography,
-            params: FingerDetectionParams::default(),
             running: true,
             calibration: CalibrationData::default(),
             debug_threshold_frame: None,
@@ -348,6 +324,7 @@ impl SharedState {
             debug_skin_threshold_height: 480,
             calibration_brightness_threshold: 200,
             camera_roi,
+            hand_landmarks: None,
         }
     }
 
@@ -589,148 +566,6 @@ fn detect_calibration_dot(frame: &Mat, min_brightness: u8, return_threshold: boo
     Ok((None, threshold_rgb))
 }
 
-/// Detect finger tip using skin color segmentation and contour analysis
-/// Returns (finger_tip_position, threshold_mask_as_rgb)
-fn detect_finger_tip(
-    frame: &Mat,
-    params: &FingerDetectionParams,
-) -> Result<(Option<(f32, f32)>, Option<Vec<u8>>)> {
-    // Convert BGR to HSV
-    let mut hsv = Mat::default();
-    imgproc::cvt_color(frame, &mut hsv, imgproc::COLOR_BGR2HSV, 0)?;
-
-    // Apply Gaussian blur to reduce noise
-    let mut blurred = Mat::default();
-    imgproc::gaussian_blur(
-        &hsv,
-        &mut blurred,
-        Size::new(params.blur_size, params.blur_size),
-        0.0,
-        0.0,
-        core::BORDER_DEFAULT,
-    )?;
-
-    // Create skin color mask using in_range
-    let lower = core::Scalar::new(
-        params.hsv_lower[0] as f64,
-        params.hsv_lower[1] as f64,
-        params.hsv_lower[2] as f64,
-        0.0,
-    );
-    let upper = core::Scalar::new(
-        params.hsv_upper[0] as f64,
-        params.hsv_upper[1] as f64,
-        params.hsv_upper[2] as f64,
-        255.0,
-    );
-    let mut mask = Mat::default();
-    core::in_range(&blurred, &lower, &upper, &mut mask)?;
-
-    // Morphological operations to clean up the mask
-    let kernel = imgproc::get_structuring_element(
-        imgproc::MORPH_ELLIPSE,
-        Size::new(5, 5),
-        Point::new(-1, -1),
-    )?;
-    
-    let mut temp = Mat::default();
-    imgproc::morphology_ex(
-        &mask,
-        &mut temp,
-        imgproc::MORPH_CLOSE,
-        &kernel,
-        Point::new(-1, -1),
-        2,
-        core::BORDER_CONSTANT,
-        imgproc::morphology_default_border_value()?,
-    )?;
-    imgproc::morphology_ex(
-        &temp,
-        &mut mask,
-        imgproc::MORPH_OPEN,
-        &kernel,
-        Point::new(-1, -1),
-        2,
-        core::BORDER_CONSTANT,
-        imgproc::morphology_default_border_value()?,
-    )?;
-
-    // Convert mask to RGB for debug display
-    let mask_rgb = {
-        let mut rgb = Mat::default();
-        imgproc::cvt_color(&mask, &mut rgb, imgproc::COLOR_GRAY2RGB, 0)?;
-        rgb.data_bytes().ok().map(|d| d.to_vec())
-    };
-
-    // Find contours
-    let mut contours: Vector<Vector<Point>> = Vector::new();
-    imgproc::find_contours(
-        &mask,
-        &mut contours,
-        imgproc::RETR_EXTERNAL,
-        imgproc::CHAIN_APPROX_SIMPLE,
-        Point::new(0, 0),
-    )?;
-
-    // Find the largest contour that meets the minimum area requirement
-    let mut best_contour_idx: Option<usize> = None;
-    let mut max_area = params.min_contour_area;
-
-    for i in 0..contours.len() {
-        let contour = contours.get(i)?;
-        let area = imgproc::contour_area(&contour, false)?;
-        if area > max_area {
-            max_area = area;
-            best_contour_idx = Some(i);
-        }
-    }
-
-    if let Some(idx) = best_contour_idx {
-        let contour = contours.get(idx)?;
-        
-        // Use convex hull to find the finger tip
-        // The finger tip is typically the point farthest from the centroid
-        // or the topmost point depending on hand orientation
-        
-        // Calculate moments to find centroid
-        let moments = imgproc::moments(&contour, false)?;
-        if moments.m00 > 0.0 {
-            let cx = (moments.m10 / moments.m00) as f32;
-            let cy = (moments.m01 / moments.m00) as f32;
-            
-            // Find convex hull
-            let mut hull = Vector::<Point>::new();
-            imgproc::convex_hull(&contour, &mut hull, false, true)?;
-            
-            // Find the point in the hull farthest from the centroid
-            // This is often the finger tip
-            let mut max_dist = 0.0f32;
-            let mut tip: Option<(f32, f32)> = None;
-            
-            for i in 0..hull.len() {
-                let pt = hull.get(i)?;
-                let dx = pt.x as f32 - cx;
-                let dy = pt.y as f32 - cy;
-                let dist = (dx * dx + dy * dy).sqrt();
-                
-                // Prefer points that are above the centroid (finger pointing up)
-                // Adjust this logic based on your camera orientation
-                let weight = if (pt.y as f32) < cy { 1.5 } else { 1.0 };
-                let weighted_dist = dist * weight;
-                
-                if weighted_dist > max_dist {
-                    max_dist = weighted_dist;
-                    tip = Some((pt.x as f32, pt.y as f32));
-                }
-            }
-            
-            return Ok((tip, mask_rgb));
-        }
-    }
-
-    Ok((None, mask_rgb))
-}
-
 /// Camera capture and processing thread
 fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
     log::info!("Opening camera at {}", device_path);
@@ -756,6 +591,21 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
     let _ = cap.set(videoio::CAP_PROP_FPS, 30.0);
 
     log::info!("Camera opened successfully");
+    
+    // Try to initialize ML hand tracker (optional)
+    let mut ml_tracker: Option<hand_tracker::HandTracker> = {
+        let model_path = hand_tracker::default_model_path();
+        match hand_tracker::HandTracker::new(&model_path) {
+            Ok(tracker) => {
+                log::info!("ML hand tracker initialized successfully");
+                Some(tracker)
+            }
+            Err(e) => {
+                log::warn!("ML hand tracker not available: {}. Using HSV detection only.", e);
+                None
+            }
+        }
+    };
 
     let mut frame = Mat::default();
 
@@ -771,12 +621,6 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
         // Capture frame
         match cap.read(&mut frame) {
             Ok(true) if !frame.empty() => {
-                // Get detection params
-                let params = {
-                    let state = state.lock().unwrap();
-                    state.params.clone()
-                };
-
                 // Check if we're in calibration capture mode
                 let is_calibrating = {
                     let state = state.lock().unwrap();
@@ -789,13 +633,14 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
                     state.camera_roi
                 };
 
-                // Detect finger tip (when not calibrating) using ROI-cropped frame if available
-                // Returns (finger_tip, skin_threshold_frame, thresh_width, thresh_height)
-                let (finger_tip, skin_threshold_frame, skin_thresh_w, skin_thresh_h) = if !is_calibrating {
+                // Detect finger tip (when not calibrating) using ML hand tracking
+                // Returns (finger_tip, debug_frame, frame_width, frame_height, hand_landmarks)
+                let (finger_tip, debug_frame, debug_w, debug_h, hand_landmarks) = if !is_calibrating && ml_tracker.is_some() {
                     // Get frame dimensions for bounds checking
                     let frame_size = frame.size().unwrap_or(Size::new(640, 480));
                     
-                    if let Some(roi) = camera_roi {
+                    // Prepare the detection frame (with optional ROI cropping)
+                    let (detect_frame, roi_offset) = if let Some(roi) = camera_roi {
                         // Clamp ROI to frame bounds
                         let roi_x = roi.x.max(0).min(frame_size.width - 1);
                         let roi_y = roi.y.max(0).min(frame_size.height - 1);
@@ -803,39 +648,83 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
                         let roi_h = roi.height.min(frame_size.height - roi_y);
                         
                         if roi_w > 10 && roi_h > 10 {
-                            // Create ROI rectangle and crop the frame
                             let roi_rect = core::Rect::new(roi_x, roi_y, roi_w, roi_h);
                             if let Ok(cropped_ref) = Mat::roi(&frame, roi_rect) {
-                                // Clone the ROI to get an owned Mat
                                 let mut cropped = Mat::default();
                                 if cropped_ref.copy_to(&mut cropped).is_ok() {
-                                    // Detect finger in cropped frame
-                                    let (tip, thresh) = detect_finger_tip(&cropped, &params).unwrap_or((None, None));
-                                    // Offset the detected position back to full frame coordinates
-                                    let offset_tip = tip.map(|(x, y)| (x + roi_x as f32, y + roi_y as f32));
-                                    (offset_tip, thresh, roi_w as u32, roi_h as u32)
+                                    (cropped, Some((roi_x, roi_y, roi_w, roi_h)))
                                 } else {
-                                    // Copy failed, use full frame
-                                    let (tip, thresh) = detect_finger_tip(&frame, &params).unwrap_or((None, None));
-                                    (tip, thresh, frame_size.width as u32, frame_size.height as u32)
+                                    (frame.clone(), None)
                                 }
                             } else {
-                                // ROI extraction failed, use full frame
-                                let (tip, thresh) = detect_finger_tip(&frame, &params).unwrap_or((None, None));
-                                (tip, thresh, frame_size.width as u32, frame_size.height as u32)
+                                (frame.clone(), None)
                             }
                         } else {
-                            // ROI too small, use full frame
-                            let (tip, thresh) = detect_finger_tip(&frame, &params).unwrap_or((None, None));
-                            (tip, thresh, frame_size.width as u32, frame_size.height as u32)
+                            (frame.clone(), None)
                         }
                     } else {
-                        // No ROI, use full frame
-                        let (tip, thresh) = detect_finger_tip(&frame, &params).unwrap_or((None, None));
-                        (tip, thresh, frame_size.width as u32, frame_size.height as u32)
+                        (frame.clone(), None)
+                    };
+                    
+                    let detect_size = detect_frame.size().unwrap_or(Size::new(640, 480));
+                    let tracker = ml_tracker.as_mut().unwrap();
+                    
+                    // Create debug visualization frame (copy of detection frame converted to RGB)
+                    let debug_rgb = {
+                        let mut rgb = Mat::default();
+                        if imgproc::cvt_color(&detect_frame, &mut rgb, imgproc::COLOR_BGR2RGB, 0).is_ok() {
+                            rgb.data_bytes().ok().map(|d| d.to_vec())
+                        } else {
+                            None
+                        }
+                    };
+                    
+                    match tracker.detect(&detect_frame) {
+                        Ok(Some(landmarks)) => {
+                            let (tip_x, tip_y) = landmarks.index_finger_tip(
+                                detect_size.width as f32,
+                                detect_size.height as f32,
+                            );
+                            
+                            // Get all landmarks for visualization (in ROI-local pixel coordinates)
+                            let local_landmarks = landmarks.all_landmarks_pixels(
+                                detect_size.width as f32,
+                                detect_size.height as f32,
+                            );
+                            
+                            // Apply ROI offset to fingertip for full-frame coordinates
+                            let final_tip = if let Some((ox, oy, _, _)) = roi_offset {
+                                (tip_x + ox as f32, tip_y + oy as f32)
+                            } else {
+                                (tip_x, tip_y)
+                            };
+                            
+                            // Keep landmarks in local ROI coordinates for debug visualization
+                            (Some(final_tip), debug_rgb, detect_size.width as u32, detect_size.height as u32, Some(local_landmarks))
+                        }
+                        Ok(None) => {
+                            // No hand detected
+                            (None, debug_rgb, detect_size.width as u32, detect_size.height as u32, None)
+                        }
+                        Err(e) => {
+                            log::debug!("ML detection error: {}", e);
+                            (None, debug_rgb, detect_size.width as u32, detect_size.height as u32, None)
+                        }
                     }
+                } else if !is_calibrating {
+                    // ML tracker not available, show frame but no detection
+                    let frame_size = frame.size().unwrap_or(Size::new(640, 480));
+                    let debug_rgb = {
+                        let mut rgb = Mat::default();
+                        if imgproc::cvt_color(&frame, &mut rgb, imgproc::COLOR_BGR2RGB, 0).is_ok() {
+                            rgb.data_bytes().ok().map(|d| d.to_vec())
+                        } else {
+                            None
+                        }
+                    };
+                    (None, debug_rgb, frame_size.width as u32, frame_size.height as u32, None)
                 } else {
-                    (None, None, 640, 480)
+                    (None, None, 640, 480, None)
                 };
                 
                 // Get calibration brightness threshold
@@ -877,9 +766,12 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
                     // Update calibration dot detection and debug frame
                     state.calibration.detected_dot = calibration_dot;
                     state.debug_threshold_frame = threshold_frame;
-                    state.debug_skin_threshold_frame = skin_threshold_frame;
-                    state.debug_skin_threshold_width = skin_thresh_w;
-                    state.debug_skin_threshold_height = skin_thresh_h;
+                    state.debug_skin_threshold_frame = debug_frame;
+                    state.debug_skin_threshold_width = debug_w;
+                    state.debug_skin_threshold_height = debug_h;
+                    
+                    // Update hand landmarks (for ML mode visualization)
+                    state.hand_landmarks = hand_landmarks;
                     
                     // Only accumulate positions during capture phase
                     if matches!(state.calibration.state, CalibrationState::CapturingDot { .. }) {
@@ -1047,51 +939,15 @@ impl eframe::App for FingerTrackerApp {
                             }
 
                             ui.separator();
-                            ui.heading("Skin Detection (HSV)");
-                            
+                            ui.heading("ML Hand Tracking");
                             {
-                                let mut state_lock = state.lock().unwrap();
-                                
-                                ui.label("Lower bounds:");
-                                ui.horizontal(|ui| {
-                                    ui.label("H:");
-                                    let mut h = state_lock.params.hsv_lower[0] as f32;
-                                    if ui.add(egui::DragValue::new(&mut h).range(0.0..=179.0)).changed() {
-                                        state_lock.params.hsv_lower[0] = h as u8;
-                                    }
-                                    ui.label("S:");
-                                    let mut s = state_lock.params.hsv_lower[1] as f32;
-                                    if ui.add(egui::DragValue::new(&mut s).range(0.0..=255.0)).changed() {
-                                        state_lock.params.hsv_lower[1] = s as u8;
-                                    }
-                                    ui.label("V:");
-                                    let mut v = state_lock.params.hsv_lower[2] as f32;
-                                    if ui.add(egui::DragValue::new(&mut v).range(0.0..=255.0)).changed() {
-                                        state_lock.params.hsv_lower[2] = v as u8;
-                                    }
-                                });
-                                
-                                ui.label("Upper bounds:");
-                                ui.horizontal(|ui| {
-                                    ui.label("H:");
-                                    let mut h = state_lock.params.hsv_upper[0] as f32;
-                                    if ui.add(egui::DragValue::new(&mut h).range(0.0..=179.0)).changed() {
-                                        state_lock.params.hsv_upper[0] = h as u8;
-                                    }
-                                    ui.label("S:");
-                                    let mut s = state_lock.params.hsv_upper[1] as f32;
-                                    if ui.add(egui::DragValue::new(&mut s).range(0.0..=255.0)).changed() {
-                                        state_lock.params.hsv_upper[1] = s as u8;
-                                    }
-                                    ui.label("V:");
-                                    let mut v = state_lock.params.hsv_upper[2] as f32;
-                                    if ui.add(egui::DragValue::new(&mut v).range(0.0..=255.0)).changed() {
-                                        state_lock.params.hsv_upper[2] = v as u8;
-                                    }
-                                });
-
-                                ui.add(egui::Slider::new(&mut state_lock.params.min_contour_area, 100.0..=10000.0)
-                                    .text("Min Area"));
+                                let ml_available = hand_tracker::model_available();
+                                if ml_available {
+                                    ui.label("✓ Hand landmark model loaded");
+                                } else {
+                                    ui.colored_label(egui::Color32::RED, "✗ Model not found");
+                                    ui.small("Place hand_landmark.onnx in models/ folder");
+                                }
                             }
 
                             ui.separator();
@@ -1241,7 +1097,7 @@ impl eframe::App for FingerTrackerApp {
                             
                             // Debug views - raw camera and threshold side by side
                             ui.add_space(8.0);
-                            let (frame_data, threshold_data, skin_threshold_data, frame_w, frame_h, skin_w, skin_h, detected_pt, finger_tip) = {
+                            let (frame_data, threshold_data, skin_threshold_data, frame_w, frame_h, skin_w, skin_h, detected_pt, finger_tip, hand_landmarks) = {
                                 let state_lock = state.lock().unwrap();
                                 (
                                     state_lock.frame.clone(),
@@ -1253,6 +1109,7 @@ impl eframe::App for FingerTrackerApp {
                                     state_lock.debug_skin_threshold_height,
                                     state_lock.calibration.detected_dot,
                                     state_lock.finger_tip_camera,
+                                    state_lock.hand_landmarks.clone(),
                                 )
                             };
                             
@@ -1412,10 +1269,116 @@ impl eframe::App for FingerTrackerApp {
                                                 egui::Color32::WHITE,
                                             );
                                             
-                                            // Draw fingertip position on skin threshold view
-                                            // Note: finger_tip is in full-frame coords, need to offset for ROI
-                                            if let Some((fx, fy)) = finger_tip {
-                                                // Get ROI offset to convert full-frame coords to ROI coords
+                                            // Draw hand skeleton on the debug view
+                                            // Hand landmarks are already in ROI-local coordinates
+                                            if let Some(landmarks) = &hand_landmarks {
+                                                let scale_x = display_width / skin_width as f32;
+                                                let scale_y = skin_display_height / skin_height as f32;
+                                                
+                                                // Helper to convert landmark to screen coordinates
+                                                let to_screen = |idx: usize| -> egui::Pos2 {
+                                                    if idx < landmarks.len() {
+                                                        let (lx, ly) = landmarks[idx];
+                                                        egui::pos2(
+                                                            rect.min.x + lx * scale_x,
+                                                            rect.min.y + ly * scale_y,
+                                                        )
+                                                    } else {
+                                                        egui::pos2(0.0, 0.0)
+                                                    }
+                                                };
+                                                
+                                                // Hand skeleton connections (MediaPipe format)
+                                                // Thumb: 0-1-2-3-4
+                                                // Index: 0-5-6-7-8
+                                                // Middle: 0-9-10-11-12
+                                                // Ring: 0-13-14-15-16
+                                                // Pinky: 0-17-18-19-20
+                                                // Palm: 5-9, 9-13, 13-17, 0-5, 0-17
+                                                let connections: &[(usize, usize, egui::Color32)] = &[
+                                                    // Thumb (orange)
+                                                    (0, 1, egui::Color32::from_rgb(255, 165, 0)),
+                                                    (1, 2, egui::Color32::from_rgb(255, 165, 0)),
+                                                    (2, 3, egui::Color32::from_rgb(255, 165, 0)),
+                                                    (3, 4, egui::Color32::from_rgb(255, 165, 0)),
+                                                    // Index (green)
+                                                    (0, 5, egui::Color32::GREEN),
+                                                    (5, 6, egui::Color32::GREEN),
+                                                    (6, 7, egui::Color32::GREEN),
+                                                    (7, 8, egui::Color32::GREEN),
+                                                    // Middle (cyan)
+                                                    (0, 9, egui::Color32::LIGHT_BLUE),
+                                                    (9, 10, egui::Color32::LIGHT_BLUE),
+                                                    (10, 11, egui::Color32::LIGHT_BLUE),
+                                                    (11, 12, egui::Color32::LIGHT_BLUE),
+                                                    // Ring (magenta)
+                                                    (0, 13, egui::Color32::from_rgb(255, 0, 255)),
+                                                    (13, 14, egui::Color32::from_rgb(255, 0, 255)),
+                                                    (14, 15, egui::Color32::from_rgb(255, 0, 255)),
+                                                    (15, 16, egui::Color32::from_rgb(255, 0, 255)),
+                                                    // Pinky (red)
+                                                    (0, 17, egui::Color32::RED),
+                                                    (17, 18, egui::Color32::RED),
+                                                    (18, 19, egui::Color32::RED),
+                                                    (19, 20, egui::Color32::RED),
+                                                    // Palm connections (white)
+                                                    (5, 9, egui::Color32::WHITE),
+                                                    (9, 13, egui::Color32::WHITE),
+                                                    (13, 17, egui::Color32::WHITE),
+                                                ];
+                                                
+                                                // Draw bones (connections)
+                                                for &(from, to, color) in connections {
+                                                    if from < landmarks.len() && to < landmarks.len() {
+                                                        ui.painter().line_segment(
+                                                            [to_screen(from), to_screen(to)],
+                                                            egui::Stroke::new(2.0, color),
+                                                        );
+                                                    }
+                                                }
+                                                
+                                                // Draw joints (landmarks)
+                                                for (idx, &(lx, ly)) in landmarks.iter().enumerate() {
+                                                    let screen_pos = egui::pos2(
+                                                        rect.min.x + lx * scale_x,
+                                                        rect.min.y + ly * scale_y,
+                                                    );
+                                                    
+                                                    // Different colors for different landmark types
+                                                    let (radius, color) = match idx {
+                                                        0 => (5.0, egui::Color32::YELLOW),  // Wrist
+                                                        4 | 8 | 12 | 16 | 20 => (4.0, egui::Color32::RED),  // Fingertips
+                                                        _ => (3.0, egui::Color32::WHITE),  // Other joints
+                                                    };
+                                                    
+                                                    ui.painter().circle_filled(screen_pos, radius, color);
+                                                }
+                                                
+                                                // Highlight index finger tip with large crosshair
+                                                if landmarks.len() > 8 {
+                                                    let tip_pos = to_screen(8);
+                                                    // Large green circle
+                                                    ui.painter().circle_stroke(
+                                                        tip_pos,
+                                                        15.0,
+                                                        egui::Stroke::new(3.0, egui::Color32::GREEN),
+                                                    );
+                                                    // Crosshair lines
+                                                    ui.painter().line_segment(
+                                                        [egui::pos2(tip_pos.x - 20.0, tip_pos.y), egui::pos2(tip_pos.x + 20.0, tip_pos.y)],
+                                                        egui::Stroke::new(2.0, egui::Color32::GREEN),
+                                                    );
+                                                    ui.painter().line_segment(
+                                                        [egui::pos2(tip_pos.x, tip_pos.y - 20.0), egui::pos2(tip_pos.x, tip_pos.y + 20.0)],
+                                                        egui::Stroke::new(2.0, egui::Color32::GREEN),
+                                                    );
+                                                    
+                                                    // Also draw wrist with big yellow marker
+                                                    let wrist_pos = to_screen(0);
+                                                    ui.painter().circle_filled(wrist_pos, 8.0, egui::Color32::YELLOW);
+                                                }
+                                            } else if let Some((fx, fy)) = finger_tip {
+                                                // Fallback: just draw fingertip if no full landmarks
                                                 let roi_offset = {
                                                     let state_lock = state.lock().unwrap();
                                                     state_lock.camera_roi.map(|r| (r.x as f32, r.y as f32)).unwrap_or((0.0, 0.0))
@@ -1428,19 +1391,9 @@ impl eframe::App for FingerTrackerApp {
                                                 let screen_x = rect.min.x + local_x * scale_x;
                                                 let screen_y = rect.min.y + local_y * scale_y;
                                                 
-                                                // Draw circle at fingertip
                                                 ui.painter().circle_stroke(
                                                     egui::pos2(screen_x, screen_y),
                                                     8.0,
-                                                    egui::Stroke::new(2.0, egui::Color32::GREEN),
-                                                );
-                                                // Draw crosshair
-                                                ui.painter().line_segment(
-                                                    [egui::pos2(screen_x - 12.0, screen_y), egui::pos2(screen_x + 12.0, screen_y)],
-                                                    egui::Stroke::new(2.0, egui::Color32::GREEN),
-                                                );
-                                                ui.painter().line_segment(
-                                                    [egui::pos2(screen_x, screen_y - 12.0), egui::pos2(screen_x, screen_y + 12.0)],
                                                     egui::Stroke::new(2.0, egui::Color32::GREEN),
                                                 );
                                             }
@@ -1769,7 +1722,7 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // Camera device path - change this if your camera is at a different device
-    let device_path = "/dev/video4";
+    let device_path = "/dev/video5";
 
     log::info!("Starting Finger Tracker");
     log::info!("Camera device: {}", device_path);
