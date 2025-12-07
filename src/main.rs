@@ -96,6 +96,10 @@ struct CalibrationData {
     detected_dot: Option<(f32, f32)>,
     /// Accumulated dot positions for averaging
     accumulated_positions: Vec<(f32, f32)>,
+    /// Minimum number of samples required for valid detection
+    minimum_samples: usize,
+    /// Maximum deviation from median to include in final average (pixels)
+    outlier_threshold: f32,
 }
 
 /// Shared state between camera thread and UI
@@ -116,6 +120,10 @@ struct SharedState {
     running: bool,
     /// Calibration data
     calibration: CalibrationData,
+    /// Debug: thresholded frame for calibration visualization (grayscale as RGB)
+    debug_threshold_frame: Option<Vec<u8>>,
+    /// Brightness threshold for calibration dot detection
+    calibration_brightness_threshold: u8,
 }
 
 impl Default for CalibrationData {
@@ -128,12 +136,67 @@ impl Default for CalibrationData {
             grid_rows: 3,
             margin: 0.1,
             dot_display_time: 1.0,
-            dot_capture_time: 1.0,
+            dot_capture_time: 2.0, // Increased capture time for more samples
             dot_radius: 20.0,
             detected_dot: None,
             accumulated_positions: Vec::new(),
+            minimum_samples: 5,      // Need at least 5 detections
+            outlier_threshold: 30.0, // Reject points > 30px from median
         }
     }
+}
+
+/// Compute median of a slice of f32 values
+fn median(values: &mut [f32]) -> f32 {
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let len = values.len();
+    if len == 0 {
+        return 0.0;
+    }
+    if len % 2 == 0 {
+        (values[len / 2 - 1] + values[len / 2]) / 2.0
+    } else {
+        values[len / 2]
+    }
+}
+
+/// Compute robust position from accumulated samples using median and outlier rejection
+fn compute_robust_position(positions: &[(f32, f32)], outlier_threshold: f32) -> Option<(f32, f32)> {
+    if positions.is_empty() {
+        return None;
+    }
+    
+    // Compute medians
+    let mut xs: Vec<f32> = positions.iter().map(|p| p.0).collect();
+    let mut ys: Vec<f32> = positions.iter().map(|p| p.1).collect();
+    
+    let median_x = median(&mut xs);
+    let median_y = median(&mut ys);
+    
+    // Filter outliers (points too far from median)
+    let filtered: Vec<(f32, f32)> = positions
+        .iter()
+        .filter(|(x, y)| {
+            let dx = x - median_x;
+            let dy = y - median_y;
+            let dist = (dx * dx + dy * dy).sqrt();
+            dist <= outlier_threshold
+        })
+        .copied()
+        .collect();
+    
+    if filtered.is_empty() {
+        // Fall back to median if all points are outliers
+        return Some((median_x, median_y));
+    }
+    
+    // Average the inliers for final position
+    let sum: (f32, f32) = filtered
+        .iter()
+        .fold((0.0, 0.0), |acc, p| (acc.0 + p.0, acc.1 + p.1));
+    let count = filtered.len() as f32;
+    
+    Some((sum.0 / count, sum.1 / count))
 }
 
 impl SharedState {
@@ -149,6 +212,8 @@ impl SharedState {
             params: FingerDetectionParams::default(),
             running: true,
             calibration: CalibrationData::default(),
+            debug_threshold_frame: None,
+            calibration_brightness_threshold: 200,
         }
     }
 
@@ -238,8 +303,8 @@ impl SharedState {
 }
 
 /// Detect a bright calibration dot in the frame
-/// Returns the centroid of the brightest blob
-fn detect_calibration_dot(frame: &Mat, min_brightness: u8) -> Result<Option<(f32, f32)>> {
+/// Returns the centroid of the brightest blob and optionally the thresholded image
+fn detect_calibration_dot(frame: &Mat, min_brightness: u8, return_threshold: bool) -> Result<(Option<(f32, f32)>, Option<Vec<u8>>)> {
     // Convert to grayscale
     let mut gray = Mat::default();
     imgproc::cvt_color(frame, &mut gray, imgproc::COLOR_BGR2GRAY, 0)?;
@@ -294,6 +359,15 @@ fn detect_calibration_dot(frame: &Mat, min_brightness: u8) -> Result<Option<(f32
         imgproc::morphology_default_border_value()?,
     )?;
     
+    // Convert threshold image to RGB for display if requested
+    let threshold_rgb = if return_threshold {
+        let mut rgb = Mat::default();
+        imgproc::cvt_color(&binary, &mut rgb, imgproc::COLOR_GRAY2RGB, 0)?;
+        rgb.data_bytes().ok().map(|d| d.to_vec())
+    } else {
+        None
+    };
+    
     // Find contours
     let mut contours: Vector<Vector<Point>> = Vector::new();
     imgproc::find_contours(
@@ -306,7 +380,7 @@ fn detect_calibration_dot(frame: &Mat, min_brightness: u8) -> Result<Option<(f32
     
     // Find the brightest and largest blob
     let mut best_contour_idx: Option<usize> = None;
-    let mut max_area = 50.0; // Minimum area to consider
+    let mut max_area = 10.0; // Minimum area to consider (lowered for small dots)
     
     for i in 0..contours.len() {
         let contour = contours.get(i)?;
@@ -323,11 +397,11 @@ fn detect_calibration_dot(frame: &Mat, min_brightness: u8) -> Result<Option<(f32
         if moments.m00 > 0.0 {
             let cx = (moments.m10 / moments.m00) as f32;
             let cy = (moments.m01 / moments.m00) as f32;
-            return Ok(Some((cx, cy)));
+            return Ok((Some((cx, cy)), threshold_rgb));
         }
     }
     
-    Ok(None)
+    Ok((None, threshold_rgb))
 }
 
 /// Detect finger tip using skin color segmentation and contour analysis
@@ -523,12 +597,16 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
                     None
                 };
                 
-                // Detect calibration dot if in capture mode
-                let calibration_dot = if is_calibrating {
-                    detect_calibration_dot(&frame, 100).unwrap_or(None)
-                } else {
-                    None
+                // Get calibration brightness threshold
+                let brightness_threshold = {
+                    let state = state.lock().unwrap();
+                    state.calibration_brightness_threshold
                 };
+                
+                // Detect calibration dot and get threshold image for debug
+                let (calibration_dot, threshold_frame) = 
+                    detect_calibration_dot(&frame, brightness_threshold, true)
+                        .unwrap_or((None, None));
 
                 // Convert frame to RGB for display
                 let mut rgb_frame = Mat::default();
@@ -555,10 +633,15 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
                         state.finger_tip_projector = None;
                     }
                     
-                    // Update calibration dot detection
+                    // Update calibration dot detection and debug frame
                     state.calibration.detected_dot = calibration_dot;
-                    if let Some(dot) = calibration_dot {
-                        state.calibration.accumulated_positions.push(dot);
+                    state.debug_threshold_frame = threshold_frame;
+                    
+                    // Only accumulate positions during capture phase
+                    if matches!(state.calibration.state, CalibrationState::CapturingDot { .. }) {
+                        if let Some(dot) = calibration_dot {
+                            state.calibration.accumulated_positions.push(dot);
+                        }
                     }
                 }
             }
@@ -622,6 +705,12 @@ impl eframe::App for FingerTrackerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Request continuous repaint for real-time updates
         ctx.request_repaint();
+
+        // Handle F11 to toggle fullscreen
+        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            let is_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
+        }
 
         // Menu bar to toggle options window
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
@@ -835,6 +924,15 @@ impl eframe::App for FingerTrackerApp {
                                 CalibrationState::CapturingDot { index, .. } => {
                                     ui.colored_label(egui::Color32::LIGHT_BLUE, 
                                         format!("Capturing dot {}/{}", index + 1, total_points));
+                                    
+                                    // Show sample count
+                                    let (sample_count, min_samples) = {
+                                        let state_lock = state.lock().unwrap();
+                                        (state_lock.calibration.accumulated_positions.len(),
+                                         state_lock.calibration.minimum_samples)
+                                    };
+                                    ui.label(format!("Samples: {}/{}", sample_count, min_samples));
+                                    
                                     if let Some((dx, dy)) = detected_dot {
                                         ui.label(format!("Detected at: ({:.1}, {:.1})", dx, dy));
                                     } else {
@@ -878,6 +976,147 @@ impl eframe::App for FingerTrackerApp {
                                 ui.add(egui::ProgressBar::new(progress)
                                     .text(format!("{}/{} points", num_points, total_points)));
                             }
+                            
+                            // Brightness threshold slider
+                            ui.add_space(4.0);
+                            {
+                                let mut state_lock = state.lock().unwrap();
+                                ui.add(egui::Slider::new(&mut state_lock.calibration_brightness_threshold, 50..=255)
+                                    .text("Brightness Threshold"));
+                            }
+                            
+                            // Debug views - raw camera and threshold side by side
+                            ui.add_space(8.0);
+                            let (frame_data, threshold_data, frame_w, frame_h, detected_pt) = {
+                                let state_lock = state.lock().unwrap();
+                                (
+                                    state_lock.frame.clone(),
+                                    state_lock.debug_threshold_frame.clone(),
+                                    state_lock.frame_width,
+                                    state_lock.frame_height,
+                                    state_lock.calibration.detected_dot,
+                                )
+                            };
+                            
+                            let width = frame_w as usize;
+                            let height = frame_h as usize;
+                            let expected_size = width * height * 3;
+                            
+                            // Display both views side by side
+                            let display_width = 160.0;
+                            let aspect = height as f32 / width as f32;
+                            let display_height = display_width * aspect;
+                            
+                            ui.horizontal(|ui| {
+                                // Raw camera feed
+                                ui.vertical(|ui| {
+                                    ui.label("Camera Feed:");
+                                    if let Some(data) = &frame_data {
+                                        if data.len() >= expected_size {
+                                            let image = egui::ColorImage::from_rgb(
+                                                [width, height],
+                                                &data[..expected_size],
+                                            );
+                                            
+                                            let texture: egui::TextureHandle = ctx.load_texture(
+                                                "debug_camera",
+                                                image,
+                                                egui::TextureOptions::LINEAR,
+                                            );
+                                            
+                                            let (rect, _response) = ui.allocate_exact_size(
+                                                egui::vec2(display_width, display_height),
+                                                egui::Sense::hover(),
+                                            );
+                                            
+                                            ui.painter().image(
+                                                texture.id(),
+                                                rect,
+                                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                                egui::Color32::WHITE,
+                                            );
+                                            
+                                            // Draw detected dot position on camera view too
+                                            if let Some((dx, dy)) = detected_pt {
+                                                let scale_x = display_width / width as f32;
+                                                let scale_y = display_height / height as f32;
+                                                let screen_x = rect.min.x + dx * scale_x;
+                                                let screen_y = rect.min.y + dy * scale_y;
+                                                
+                                                ui.painter().circle_stroke(
+                                                    egui::pos2(screen_x, screen_y),
+                                                    6.0,
+                                                    egui::Stroke::new(2.0, egui::Color32::GREEN),
+                                                );
+                                            }
+                                        } else {
+                                            ui.colored_label(egui::Color32::GRAY, "Size mismatch");
+                                        }
+                                    } else {
+                                        ui.colored_label(egui::Color32::GRAY, "No data");
+                                    }
+                                });
+                                
+                                ui.add_space(8.0);
+                                
+                                // Threshold debug view
+                                ui.vertical(|ui| {
+                                    ui.label("Threshold View:");
+                                    if let Some(data) = &threshold_data {
+                                        if data.len() >= expected_size {
+                                            let image = egui::ColorImage::from_rgb(
+                                                [width, height],
+                                                &data[..expected_size],
+                                            );
+                                            
+                                            let texture: egui::TextureHandle = ctx.load_texture(
+                                                "debug_threshold",
+                                                image,
+                                                egui::TextureOptions::LINEAR,
+                                            );
+                                            
+                                            let (rect, _response) = ui.allocate_exact_size(
+                                                egui::vec2(display_width, display_height),
+                                                egui::Sense::hover(),
+                                            );
+                                            
+                                            ui.painter().image(
+                                                texture.id(),
+                                                rect,
+                                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                                egui::Color32::WHITE,
+                                            );
+                                            
+                                            // Draw detected dot position on threshold view
+                                            if let Some((dx, dy)) = detected_pt {
+                                                let scale_x = display_width / width as f32;
+                                                let scale_y = display_height / height as f32;
+                                                let screen_x = rect.min.x + dx * scale_x;
+                                                let screen_y = rect.min.y + dy * scale_y;
+                                                
+                                                // Draw crosshair at detected position
+                                                ui.painter().circle_stroke(
+                                                    egui::pos2(screen_x, screen_y),
+                                                    6.0,
+                                                    egui::Stroke::new(2.0, egui::Color32::RED),
+                                                );
+                                                ui.painter().line_segment(
+                                                    [egui::pos2(screen_x - 10.0, screen_y), egui::pos2(screen_x + 10.0, screen_y)],
+                                                    egui::Stroke::new(1.0, egui::Color32::RED),
+                                                );
+                                                ui.painter().line_segment(
+                                                    [egui::pos2(screen_x, screen_y - 10.0), egui::pos2(screen_x, screen_y + 10.0)],
+                                                    egui::Stroke::new(1.0, egui::Color32::RED),
+                                                );
+                                            }
+                                        } else {
+                                            ui.colored_label(egui::Color32::GRAY, "Size mismatch");
+                                        }
+                                    } else {
+                                        ui.colored_label(egui::Color32::GRAY, "No data");
+                                    }
+                                });
+                            });
 
                             ui.separator();
                             ui.heading("Status");
@@ -1076,32 +1315,45 @@ impl eframe::App for FingerTrackerApp {
                             state.calibration.dot_capture_time
                         };
                         if start_time.elapsed().as_secs_f32() > capture_time {
-                            // Average accumulated positions
+                            // Compute robust position using median and outlier rejection
                             let mut state = self.state.lock().unwrap();
-                            if !state.calibration.accumulated_positions.is_empty() {
-                                let sum: (f32, f32) = state.calibration.accumulated_positions
-                                    .iter()
-                                    .fold((0.0, 0.0), |acc, p| (acc.0 + p.0, acc.1 + p.1));
-                                let count = state.calibration.accumulated_positions.len() as f32;
-                                let avg = (sum.0 / count, sum.1 / count);
-                                state.calibration.camera_points.push(avg);
-                                
-                                let next_index = index + 1;
-                                if next_index < state.calibration.projector_points.len() {
-                                    // Move to next point
-                                    state.calibration.state = CalibrationState::DisplayingDot {
-                                        index: next_index,
-                                        start_time: Instant::now(),
-                                    };
+                            let num_samples = state.calibration.accumulated_positions.len();
+                            let min_samples = state.calibration.minimum_samples;
+                            let outlier_threshold = state.calibration.outlier_threshold;
+                            
+                            if num_samples >= min_samples {
+                                if let Some(robust_pos) = compute_robust_position(
+                                    &state.calibration.accumulated_positions,
+                                    outlier_threshold,
+                                ) {
+                                    state.calibration.camera_points.push(robust_pos);
+                                    
+                                    let next_index = index + 1;
+                                    if next_index < state.calibration.projector_points.len() {
+                                        // Move to next point
+                                        state.calibration.state = CalibrationState::DisplayingDot {
+                                            index: next_index,
+                                            start_time: Instant::now(),
+                                        };
+                                    } else {
+                                        // All points captured, compute homography
+                                        state.calibration.state = CalibrationState::Computing;
+                                    }
                                 } else {
-                                    // All points captured, compute homography
-                                    state.calibration.state = CalibrationState::Computing;
+                                    // Robust computation failed (shouldn't happen)
+                                    state.calibration.state = CalibrationState::Complete {
+                                        success: false,
+                                        message: format!("Failed to compute position for dot {}", index + 1),
+                                    };
                                 }
                             } else {
-                                // No detections - failed
+                                // Not enough samples - failed
                                 state.calibration.state = CalibrationState::Complete {
                                     success: false,
-                                    message: format!("Failed to detect dot {} - no bright spot found", index + 1),
+                                    message: format!(
+                                        "Failed to detect dot {} - only {} samples (need {})",
+                                        index + 1, num_samples, min_samples
+                                    ),
                                 };
                             }
                         }
