@@ -2,6 +2,13 @@
 
 A camera-projector finger tracking application that uses MediaPipe hand landmark detection to track fingertip positions and map them to projector coordinates.
 
+## Features
+
+- **Hand Tracking**: Uses MediaPipe hand landmarks via Python subprocess
+- **Pinch Detection**: Detects thumb-index finger pinch gesture and creates ripple wave effects
+- **Background Images**: Display custom background images from the assets folder
+- **AI Image Generation**: Generate background images using Google Gemini API
+
 ## Prerequisites
 
 - Rust (edition 2021)
@@ -33,11 +40,27 @@ cargo build --release
 cargo run --release
 ```
 
+### 4. (Optional) Set Up Gemini API for Image Generation
+
+To enable AI background image generation:
+
+1. Get a Gemini API key from [Google AI Studio](https://aistudio.google.com/app/apikey)
+2. Create the config directory and token file:
+
+   ```bash
+   mkdir -p ~/.config/finger_tracker
+   echo "YOUR_API_KEY_HERE" > ~/.config/finger_tracker/gemini_api_token.txt
+   ```
+
 ## Usage
 
 1. **Calibration**: Click "Start Calibration" to begin the camera-projector calibration process. A dot will appear on the projector - position your camera to see it and the system will automatically detect the correspondence points.
 
 2. **Tracking**: Once calibrated, the application will track your hand and map the index finger tip position to projector coordinates.
+
+3. **Pinch Gesture**: Bring your thumb and index finger close together to trigger a ripple wave effect at that location.
+
+4. **Image Generation**: Open the Options window (View → Options Window) and use the Image Generation panel to generate AI backgrounds using Gemini.
 
 ## Files
 
@@ -45,6 +68,8 @@ cargo run --release
 - `src/hand_tracker.rs` - Hand tracking module using MediaPipe via Python subprocess
 - `hand_detect.py` - Python script for MediaPipe hand landmark detection
 - `models/hand_landmarker.task` - MediaPipe hand landmarker model (download separately)
+- `assets/cave-map.jpg` - Default background image
+- `assets/generated_background.png` - AI-generated background (created when using image generation)
 
 ## Configuration
 
@@ -52,3 +77,5 @@ Configuration files are stored in `~/.config/finger_tracker/`:
 
 - `homography.txt` - Camera-to-projector transformation matrix
 - `camera_roi.txt` - Region of interest for hand detection
+- `gemini_api_token.txt` - Gemini API token for image generation (optional)
+

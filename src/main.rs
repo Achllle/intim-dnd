@@ -1,6 +1,7 @@
 mod hand_tracker;
 
 use anyhow::Result;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use eframe::egui;
 use nalgebra::{Matrix3, Vector3};
 use opencv::{
@@ -10,11 +11,133 @@ use opencv::{
     prelude::*,
     videoio::{self, VideoCapture, CAP_V4L2},
 };
+use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Load Gemini API token from file
+fn load_gemini_api_token() -> Option<String> {
+    let paths = [
+        PathBuf::from("gemini_api_token.txt"),
+        dirs::config_dir().map(|d| d.join("finger_tracker/gemini_api_token.txt")).unwrap_or_default(),
+        dirs::home_dir().map(|d| d.join(".gemini_api_token")).unwrap_or_default(),
+    ];
+    
+    for path in &paths {
+        if path.exists() {
+            if let Ok(token) = fs::read_to_string(path) {
+                let token = token.trim().to_string();
+                if !token.is_empty() {
+                    log::info!("Loaded Gemini API token from {:?}", path);
+                    return Some(token);
+                }
+            }
+        }
+    }
+    
+    log::warn!("Gemini API token not found. Create gemini_api_token.txt with your API key.");
+    None
+}
+
+/// Gemini API response structures
+#[derive(Deserialize, Debug)]
+struct GeminiResponse {
+    candidates: Option<Vec<GeminiCandidate>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct GeminiCandidate {
+    content: Option<GeminiContent>,
+}
+
+#[derive(Deserialize, Debug)]
+struct GeminiContent {
+    parts: Option<Vec<GeminiPart>>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct GeminiPart {
+    inline_data: Option<GeminiInlineData>,
+    text: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct GeminiInlineData {
+    mime_type: String,
+    data: String,
+}
+
+/// Image generation status
+#[derive(Clone, PartialEq)]
+enum ImageGenStatus {
+    Idle,
+    Generating,
+    Success(String),
+    Error(String),
+}
+
+/// Generate an image using Gemini API
+fn generate_image_with_gemini(api_token: &str, prompt: &str) -> Result<Vec<u8>, String> {
+    // Use Gemini image generation model
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image-preview:generateContent?key={}",
+        api_token
+    );
+    
+    let request_body = serde_json::json!({
+        "contents": [{
+            "parts": [{
+                "text": prompt
+            }]
+        }],
+        "generationConfig": {
+            "responseModalities": ["TEXT", "IMAGE"]
+        }
+    });
+    
+    log::info!("Sending image generation request to Gemini API...");
+    
+    let response = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_json(&request_body)
+        .map_err(|e| format!("API request failed: {}", e))?;
+    
+    let response_text = response.into_string()
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+    
+    log::debug!("Gemini API response: {}", &response_text[..500.min(response_text.len())]);
+    
+    // Parse Gemini response
+    let gemini_response: GeminiResponse = serde_json::from_str(&response_text)
+        .map_err(|e| format!("Failed to parse response: {} - {}", e, &response_text[..200.min(response_text.len())]))?;
+    
+    // Extract image data from response
+    if let Some(candidates) = gemini_response.candidates {
+        for candidate in candidates {
+            if let Some(content) = candidate.content {
+                if let Some(parts) = content.parts {
+                    for part in parts {
+                        if let Some(inline_data) = part.inline_data {
+                            if inline_data.mime_type.starts_with("image/") {
+                                let image_bytes = BASE64.decode(&inline_data.data)
+                                    .map_err(|e| format!("Failed to decode image: {}", e))?;
+                                log::info!("Successfully generated image ({} bytes)", image_bytes.len());
+                                return Ok(image_bytes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Err(format!("No image found in response: {}", &response_text[..300.min(response_text.len())]))
+}
 
 /// Hardcoded homography matrix for camera-to-projector transformation
 /// This 3x3 matrix transforms points from camera coordinates to projector coordinates
@@ -879,6 +1002,10 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
 struct FingerTrackerApp {
     state: Arc<Mutex<SharedState>>,
     texture: Option<egui::TextureHandle>,
+    /// Background image for projector output
+    background_texture: Option<egui::TextureHandle>,
+    /// Background image data (loaded once)
+    background_image: Option<egui::ColorImage>,
     /// UI toggle for showing camera feed vs projector output
     show_camera_feed: bool,
     /// Circle radius for finger indicator
@@ -892,6 +1019,12 @@ struct FingerTrackerApp {
     homography_edit: [[f64; 3]; 3],
     /// Whether to show the options window
     show_options_window: bool,
+    /// Gemini API token
+    gemini_api_token: Option<String>,
+    /// Image generation prompt
+    image_gen_prompt: String,
+    /// Image generation status
+    image_gen_status: Arc<Mutex<ImageGenStatus>>,
 }
 
 impl FingerTrackerApp {
@@ -906,9 +1039,18 @@ impl FingerTrackerApp {
                 [h[(2, 0)], h[(2, 1)], h[(2, 2)]],
             ]
         };
+        
+        // Load background image
+        let background_image = Self::load_background_image("assets/cave-map.jpg");
+        
+        // Load Gemini API token
+        let gemini_api_token = load_gemini_api_token();
+        
         Self {
             state,
             texture: None,
+            background_texture: None,
+            background_image,
             show_camera_feed: true,
             circle_radius: 30.0,
             circle_color: egui::Color32::from_rgb(255, 100, 100),
@@ -916,7 +1058,44 @@ impl FingerTrackerApp {
             projector_height: 1080.0,
             homography_edit,
             show_options_window: true,
+            gemini_api_token,
+            image_gen_prompt: String::new(),
+            image_gen_status: Arc::new(Mutex::new(ImageGenStatus::Idle)),
         }
+    }
+    
+    /// Load a background image from file
+    fn load_background_image(path: &str) -> Option<egui::ColorImage> {
+        let path = std::path::Path::new(path);
+        if !path.exists() {
+            log::warn!("Background image not found at {:?}", path);
+            return None;
+        }
+        
+        match image::open(path) {
+            Ok(img) => {
+                let rgba = img.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let pixels = rgba.into_raw();
+                log::info!("Loaded background image: {}x{}", size[0], size[1]);
+                Some(egui::ColorImage::from_rgba_unmultiplied(size, &pixels))
+            }
+            Err(e) => {
+                log::error!("Failed to load background image: {}", e);
+                None
+            }
+        }
+    }
+    
+    /// Reload background image (after generation)
+    fn reload_background(&mut self) {
+        self.background_image = Self::load_background_image("assets/generated_background.png");
+        if self.background_image.is_none() {
+            // Fall back to original if generated doesn't exist
+            self.background_image = Self::load_background_image("assets/cave-map.jpg");
+        }
+        // Clear the texture so it gets recreated with new image
+        self.background_texture = None;
     }
 }
 
@@ -956,6 +1135,10 @@ impl eframe::App for FingerTrackerApp {
             let projector_height = Arc::new(Mutex::new(self.projector_height));
             let homography_edit = Arc::new(Mutex::new(self.homography_edit));
             let show_options = Arc::new(Mutex::new(true));
+            let image_gen_prompt = Arc::new(Mutex::new(self.image_gen_prompt.clone()));
+            let image_gen_status = self.image_gen_status.clone();
+            let gemini_api_token = self.gemini_api_token.clone();
+            let reload_background = Arc::new(Mutex::new(false));
 
             // Clone Arcs for the closure
             let show_camera_feed_c = show_camera_feed.clone();
@@ -965,6 +1148,9 @@ impl eframe::App for FingerTrackerApp {
             let projector_height_c = projector_height.clone();
             let homography_edit_c = homography_edit.clone();
             let show_options_c = show_options.clone();
+            let image_gen_prompt_c = image_gen_prompt.clone();
+            let image_gen_status_c = image_gen_status.clone();
+            let reload_background_c = reload_background.clone();
 
             ctx.show_viewport_immediate(
                 options_viewport_id(),
@@ -1485,6 +1671,85 @@ impl eframe::App for FingerTrackerApp {
                             });
 
                             ui.separator();
+                            ui.heading("🎨 Image Generation");
+                            
+                            // Check API token status
+                            if gemini_api_token.is_none() {
+                                ui.colored_label(egui::Color32::RED, "⚠️ No API token found");
+                                ui.small("Create gemini_api_token.txt with your Gemini API key");
+                            } else {
+                                ui.colored_label(egui::Color32::GREEN, "✓ API token loaded");
+                                
+                                // Prompt input
+                                ui.label("Enter prompt for background image:");
+                                {
+                                    let mut prompt = image_gen_prompt_c.lock().unwrap();
+                                    ui.add(egui::TextEdit::multiline(&mut *prompt)
+                                        .desired_rows(3)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text("e.g., A dark cave with glowing crystals, top-down view, fantasy map style"));
+                                }
+                                
+                                // Generation status
+                                let status = image_gen_status_c.lock().unwrap().clone();
+                                match &status {
+                                    ImageGenStatus::Idle => {
+                                        let prompt = image_gen_prompt_c.lock().unwrap().clone();
+                                        let can_generate = !prompt.trim().is_empty();
+                                        
+                                        if ui.add_enabled(can_generate, egui::Button::new("🖼️ Generate Background")).clicked() {
+                                            // Start generation in background thread
+                                            let token = gemini_api_token.clone().unwrap();
+                                            let status_clone = image_gen_status_c.clone();
+                                            let reload_clone = reload_background_c.clone();
+                                            
+                                            *status_clone.lock().unwrap() = ImageGenStatus::Generating;
+                                            
+                                            thread::spawn(move || {
+                                                match generate_image_with_gemini(&token, &prompt) {
+                                                    Ok(image_bytes) => {
+                                                        // Save to assets folder
+                                                        let save_path = "assets/generated_background.png";
+                                                        match fs::write(save_path, &image_bytes) {
+                                                            Ok(_) => {
+                                                                log::info!("Saved generated image to {}", save_path);
+                                                                *status_clone.lock().unwrap() = ImageGenStatus::Success(save_path.to_string());
+                                                                *reload_clone.lock().unwrap() = true;
+                                                            }
+                                                            Err(e) => {
+                                                                *status_clone.lock().unwrap() = ImageGenStatus::Error(format!("Failed to save: {}", e));
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        *status_clone.lock().unwrap() = ImageGenStatus::Error(e);
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                    ImageGenStatus::Generating => {
+                                        ui.horizontal(|ui| {
+                                            ui.spinner();
+                                            ui.label("Generating image...");
+                                        });
+                                    }
+                                    ImageGenStatus::Success(path) => {
+                                        ui.colored_label(egui::Color32::GREEN, format!("✓ Image saved to {}", path));
+                                        if ui.button("Generate Another").clicked() {
+                                            *image_gen_status_c.lock().unwrap() = ImageGenStatus::Idle;
+                                        }
+                                    }
+                                    ImageGenStatus::Error(err) => {
+                                        ui.colored_label(egui::Color32::RED, format!("✗ Error: {}", err));
+                                        if ui.button("Try Again").clicked() {
+                                            *image_gen_status_c.lock().unwrap() = ImageGenStatus::Idle;
+                                        }
+                                    }
+                                }
+                            }
+
+                            ui.separator();
                             ui.heading("Status");
                             let state_lock = state.lock().unwrap();
                             if let Some(camera_pt) = state_lock.finger_tip_camera {
@@ -1517,6 +1782,13 @@ impl eframe::App for FingerTrackerApp {
             self.projector_height = *projector_height.lock().unwrap();
             self.homography_edit = *homography_edit.lock().unwrap();
             self.show_options_window = *show_options.lock().unwrap();
+            self.image_gen_prompt = image_gen_prompt.lock().unwrap().clone();
+            
+            // Check if we need to reload the background image
+            if *reload_background.lock().unwrap() {
+                *reload_background.lock().unwrap() = false;
+                self.reload_background();
+            }
         }
 
         // Main panel for visualization
@@ -1636,8 +1908,28 @@ impl eframe::App for FingerTrackerApp {
                 let available_size = ui.available_size();
                 let (rect, _response) = ui.allocate_exact_size(available_size, egui::Sense::hover());
                 
-                // Black background (projector output)
-                ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+                // Draw background image or black if not available
+                if let Some(ref bg_image) = self.background_image {
+                    // Create/update the background texture if needed
+                    let bg_texture = self.background_texture.get_or_insert_with(|| {
+                        ctx.load_texture(
+                            "background",
+                            bg_image.clone(),
+                            egui::TextureOptions::LINEAR,
+                        )
+                    });
+                    
+                    // Draw background image scaled to fill the available area
+                    ui.painter().image(
+                        bg_texture.id(),
+                        rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                } else {
+                    // Fallback to black background
+                    ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+                }
                 
                 // Scale factors for projector to screen conversion
                 let scale_x = available_size.x / self.projector_width;
