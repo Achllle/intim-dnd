@@ -183,6 +183,8 @@ struct SharedState {
     calibration: CalibrationData,
     /// Debug: thresholded frame for calibration visualization (grayscale as RGB)
     debug_threshold_frame: Option<Vec<u8>>,
+    /// Debug: skin-thresholded frame for finger detection visualization (grayscale as RGB)
+    debug_skin_threshold_frame: Option<Vec<u8>>,
     /// Brightness threshold for calibration dot detection
     calibration_brightness_threshold: u8,
 }
@@ -276,6 +278,7 @@ impl SharedState {
             running: true,
             calibration: CalibrationData::default(),
             debug_threshold_frame: None,
+            debug_skin_threshold_frame: None,
             calibration_brightness_threshold: 200,
         }
     }
@@ -468,10 +471,11 @@ fn detect_calibration_dot(frame: &Mat, min_brightness: u8, return_threshold: boo
 }
 
 /// Detect finger tip using skin color segmentation and contour analysis
+/// Returns (finger_tip_position, threshold_mask_as_rgb)
 fn detect_finger_tip(
     frame: &Mat,
     params: &FingerDetectionParams,
-) -> Result<Option<(f32, f32)>> {
+) -> Result<(Option<(f32, f32)>, Option<Vec<u8>>)> {
     // Convert BGR to HSV
     let mut hsv = Mat::default();
     imgproc::cvt_color(frame, &mut hsv, imgproc::COLOR_BGR2HSV, 0)?;
@@ -531,6 +535,13 @@ fn detect_finger_tip(
         core::BORDER_CONSTANT,
         imgproc::morphology_default_border_value()?,
     )?;
+
+    // Convert mask to RGB for debug display
+    let mask_rgb = {
+        let mut rgb = Mat::default();
+        imgproc::cvt_color(&mask, &mut rgb, imgproc::COLOR_GRAY2RGB, 0)?;
+        rgb.data_bytes().ok().map(|d| d.to_vec())
+    };
 
     // Find contours
     let mut contours: Vector<Vector<Point>> = Vector::new();
@@ -594,11 +605,11 @@ fn detect_finger_tip(
                 }
             }
             
-            return Ok(tip);
+            return Ok((tip, mask_rgb));
         }
     }
 
-    Ok(None)
+    Ok((None, mask_rgb))
 }
 
 /// Camera capture and processing thread
@@ -654,10 +665,10 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
                 };
 
                 // Detect finger tip (when not calibrating) or calibration dot
-                let finger_tip = if !is_calibrating {
-                    detect_finger_tip(&frame, &params).unwrap_or(None)
+                let (finger_tip, skin_threshold_frame) = if !is_calibrating {
+                    detect_finger_tip(&frame, &params).unwrap_or((None, None))
                 } else {
-                    None
+                    (None, None)
                 };
                 
                 // Get calibration brightness threshold
@@ -699,6 +710,7 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
                     // Update calibration dot detection and debug frame
                     state.calibration.detected_dot = calibration_dot;
                     state.debug_threshold_frame = threshold_frame;
+                    state.debug_skin_threshold_frame = skin_threshold_frame;
                     
                     // Only accumulate positions during capture phase
                     if matches!(state.calibration.state, CalibrationState::CapturingDot { .. }) {
@@ -1060,14 +1072,16 @@ impl eframe::App for FingerTrackerApp {
                             
                             // Debug views - raw camera and threshold side by side
                             ui.add_space(8.0);
-                            let (frame_data, threshold_data, frame_w, frame_h, detected_pt) = {
+                            let (frame_data, threshold_data, skin_threshold_data, frame_w, frame_h, detected_pt, finger_tip) = {
                                 let state_lock = state.lock().unwrap();
                                 (
                                     state_lock.frame.clone(),
                                     state_lock.debug_threshold_frame.clone(),
+                                    state_lock.debug_skin_threshold_frame.clone(),
                                     state_lock.frame_width,
                                     state_lock.frame_height,
                                     state_lock.calibration.detected_dot,
+                                    state_lock.finger_tip_camera,
                                 )
                             };
                             
@@ -1180,6 +1194,67 @@ impl eframe::App for FingerTrackerApp {
                                                 ui.painter().line_segment(
                                                     [egui::pos2(screen_x, screen_y - 10.0), egui::pos2(screen_x, screen_y + 10.0)],
                                                     egui::Stroke::new(1.0, egui::Color32::RED),
+                                                );
+                                            }
+                                        } else {
+                                            ui.colored_label(egui::Color32::GRAY, "Size mismatch");
+                                        }
+                                    } else {
+                                        ui.colored_label(egui::Color32::GRAY, "No data");
+                                    }
+                                });
+                                
+                                ui.add_space(8.0);
+                                
+                                // Skin threshold view with fingertip indicator
+                                ui.vertical(|ui| {
+                                    ui.label("Skin Threshold:");
+                                    if let Some(data) = &skin_threshold_data {
+                                        if data.len() >= expected_size {
+                                            let image = egui::ColorImage::from_rgb(
+                                                [width, height],
+                                                &data[..expected_size],
+                                            );
+                                            
+                                            let texture: egui::TextureHandle = ctx.load_texture(
+                                                "debug_skin_threshold",
+                                                image,
+                                                egui::TextureOptions::LINEAR,
+                                            );
+                                            
+                                            let (rect, _response) = ui.allocate_exact_size(
+                                                egui::vec2(display_width, display_height),
+                                                egui::Sense::hover(),
+                                            );
+                                            
+                                            ui.painter().image(
+                                                texture.id(),
+                                                rect,
+                                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                                egui::Color32::WHITE,
+                                            );
+                                            
+                                            // Draw fingertip position on skin threshold view
+                                            if let Some((fx, fy)) = finger_tip {
+                                                let scale_x = display_width / width as f32;
+                                                let scale_y = display_height / height as f32;
+                                                let screen_x = rect.min.x + fx * scale_x;
+                                                let screen_y = rect.min.y + fy * scale_y;
+                                                
+                                                // Draw circle at fingertip
+                                                ui.painter().circle_stroke(
+                                                    egui::pos2(screen_x, screen_y),
+                                                    8.0,
+                                                    egui::Stroke::new(2.0, egui::Color32::GREEN),
+                                                );
+                                                // Draw crosshair
+                                                ui.painter().line_segment(
+                                                    [egui::pos2(screen_x - 12.0, screen_y), egui::pos2(screen_x + 12.0, screen_y)],
+                                                    egui::Stroke::new(2.0, egui::Color32::GREEN),
+                                                );
+                                                ui.painter().line_segment(
+                                                    [egui::pos2(screen_x, screen_y - 12.0), egui::pos2(screen_x, screen_y + 12.0)],
+                                                    egui::Stroke::new(2.0, egui::Color32::GREEN),
                                                 );
                                             }
                                         } else {
