@@ -1051,7 +1051,7 @@ impl FingerTrackerApp {
             texture: None,
             background_texture: None,
             background_image,
-            show_camera_feed: true,
+            show_camera_feed: false,
             circle_radius: 30.0,
             circle_color: egui::Color32::from_rgb(255, 100, 100),
             projector_width: 1920.0,
