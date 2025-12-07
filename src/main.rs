@@ -47,6 +47,21 @@ struct CameraRoi {
     height: i32,
 }
 
+/// A ripple effect emanating from a pinch location
+#[derive(Clone)]
+struct Ripple {
+    /// Center position in projector coordinates
+    center: (f32, f32),
+    /// Time when the ripple was created
+    start_time: Instant,
+    /// Maximum radius the ripple will expand to
+    max_radius: f32,
+    /// Duration of the ripple animation in seconds
+    duration: f32,
+    /// Color of the ripple
+    color: egui::Color32,
+}
+
 /// Get the path to the homography calibration file
 fn get_homography_file_path() -> PathBuf {
     // Store in user's config directory or current directory
@@ -227,6 +242,14 @@ struct SharedState {
     camera_roi: Option<CameraRoi>,
     /// Hand landmarks for visualization (when using ML detection)
     hand_landmarks: Option<Vec<(f32, f32)>>,
+    /// Whether a pinch is currently detected
+    is_pinching: bool,
+    /// Pinch center in camera coordinates (normalized 0-1)
+    pinch_center_camera: Option<(f32, f32)>,
+    /// Active ripple effects
+    ripples: Vec<Ripple>,
+    /// Cooldown to prevent multiple ripples from same pinch
+    last_pinch_time: Option<Instant>,
 }
 
 impl Default for CalibrationData {
@@ -325,6 +348,10 @@ impl SharedState {
             calibration_brightness_threshold: 200,
             camera_roi,
             hand_landmarks: None,
+            is_pinching: false,
+            pinch_center_camera: None,
+            ripples: Vec::new(),
+            last_pinch_time: None,
         }
     }
 
@@ -634,8 +661,8 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
                 };
 
                 // Detect finger tip (when not calibrating) using ML hand tracking
-                // Returns (finger_tip, debug_frame, frame_width, frame_height, hand_landmarks)
-                let (finger_tip, debug_frame, debug_w, debug_h, hand_landmarks) = if !is_calibrating && ml_tracker.is_some() {
+                // Returns (finger_tip, debug_frame, frame_width, frame_height, hand_landmarks, pinch_center)
+                let (finger_tip, debug_frame, debug_w, debug_h, hand_landmarks, pinch_center) = if !is_calibrating && ml_tracker.is_some() {
                     // Get frame dimensions for bounds checking
                     let frame_size = frame.size().unwrap_or(Size::new(640, 480));
                     
@@ -692,6 +719,10 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
                                 detect_size.height as f32,
                             );
                             
+                            // Detect pinch gesture (threshold is normalized distance)
+                            let pinch_threshold = 0.05; // 5% of image dimension
+                            let pinch_result = landmarks.detect_pinch(pinch_threshold);
+                            
                             // Apply ROI offset to fingertip for full-frame coordinates
                             let final_tip = if let Some((ox, oy, _, _)) = roi_offset {
                                 (tip_x + ox as f32, tip_y + oy as f32)
@@ -700,15 +731,15 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
                             };
                             
                             // Keep landmarks in local ROI coordinates for debug visualization
-                            (Some(final_tip), debug_rgb, detect_size.width as u32, detect_size.height as u32, Some(local_landmarks))
+                            (Some(final_tip), debug_rgb, detect_size.width as u32, detect_size.height as u32, Some(local_landmarks), pinch_result)
                         }
                         Ok(None) => {
                             // No hand detected
-                            (None, debug_rgb, detect_size.width as u32, detect_size.height as u32, None)
+                            (None, debug_rgb, detect_size.width as u32, detect_size.height as u32, None, None)
                         }
                         Err(e) => {
                             log::debug!("ML detection error: {}", e);
-                            (None, debug_rgb, detect_size.width as u32, detect_size.height as u32, None)
+                            (None, debug_rgb, detect_size.width as u32, detect_size.height as u32, None, None)
                         }
                     }
                 } else if !is_calibrating {
@@ -722,9 +753,9 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
                             None
                         }
                     };
-                    (None, debug_rgb, frame_size.width as u32, frame_size.height as u32, None)
+                    (None, debug_rgb, frame_size.width as u32, frame_size.height as u32, None, None)
                 } else {
-                    (None, None, 640, 480, None)
+                    (None, None, 640, 480, None, None)
                 };
                 
                 // Get calibration brightness threshold
@@ -772,6 +803,52 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
                     
                     // Update hand landmarks (for ML mode visualization)
                     state.hand_landmarks = hand_landmarks;
+                    
+                    // Handle pinch detection and ripple creation
+                    let was_pinching = state.is_pinching;
+                    state.is_pinching = pinch_center.is_some();
+                    state.pinch_center_camera = pinch_center;
+                    
+                    // Create a ripple on pinch start (rising edge)
+                    if state.is_pinching && !was_pinching {
+                        // Check cooldown to prevent rapid ripples
+                        let cooldown_ok = state.last_pinch_time
+                            .map(|t| t.elapsed().as_secs_f32() > 0.3)
+                            .unwrap_or(true);
+                        
+                        if cooldown_ok {
+                            if let Some((px, py)) = pinch_center {
+                                // Convert normalized pinch center to full camera coordinates
+                                let camera_roi = state.camera_roi;
+                                let (cam_x, cam_y) = if let Some(roi) = camera_roi {
+                                    // Pinch is in ROI-local normalized coords, convert to full frame
+                                    let full_x = roi.x as f32 + px * roi.width as f32;
+                                    let full_y = roi.y as f32 + py * roi.height as f32;
+                                    (full_x, full_y)
+                                } else {
+                                    // Pinch is in full frame normalized coords
+                                    (px * state.frame_width as f32, py * state.frame_height as f32)
+                                };
+                                
+                                // Transform to projector coordinates
+                                let proj_pos = state.transform_point((cam_x, cam_y));
+                                
+                                log::info!("Pinch detected! Creating ripple at projector ({:.0}, {:.0})", proj_pos.0, proj_pos.1);
+                                
+                                state.ripples.push(Ripple {
+                                    center: proj_pos,
+                                    start_time: Instant::now(),
+                                    max_radius: 300.0,
+                                    duration: 1.5,
+                                    color: egui::Color32::from_rgba_unmultiplied(100, 200, 255, 200),
+                                });
+                                state.last_pinch_time = Some(Instant::now());
+                            }
+                        }
+                    }
+                    
+                    // Clean up expired ripples
+                    state.ripples.retain(|r| r.start_time.elapsed().as_secs_f32() < r.duration);
                     
                     // Only accumulate positions during capture phase
                     if matches!(state.calibration.state, CalibrationState::CapturingDot { .. }) {
@@ -1537,7 +1614,7 @@ impl eframe::App for FingerTrackerApp {
             } else {
                 // Projector output mode - black background with finger circle
                 // This is what gets displayed on the projector
-                let (finger_projector, calib_state, calib_point, dot_radius) = {
+                let (finger_projector, calib_state, calib_point, dot_radius, ripples, is_pinching) = {
                     let state = self.state.lock().unwrap();
                     let calib_point = match state.calibration.state {
                         CalibrationState::DisplayingDot { index, .. } |
@@ -1551,6 +1628,8 @@ impl eframe::App for FingerTrackerApp {
                         state.calibration.state.clone(),
                         calib_point,
                         state.calibration.dot_radius,
+                        state.ripples.clone(),
+                        state.is_pinching,
                     )
                 };
 
@@ -1693,16 +1772,61 @@ impl eframe::App for FingerTrackerApp {
                             let screen_y = rect.min.y + py * scale_y;
 
                             // Draw the finger indicator circle
+                            // Change color if pinching
+                            let finger_color = if is_pinching {
+                                egui::Color32::from_rgb(100, 255, 100) // Green when pinching
+                            } else {
+                                self.circle_color
+                            };
+                            
                             ui.painter().circle_filled(
                                 egui::pos2(screen_x, screen_y),
                                 self.circle_radius,
-                                self.circle_color,
+                                finger_color,
                             );
                             ui.painter().circle_stroke(
                                 egui::pos2(screen_x, screen_y),
                                 self.circle_radius,
                                 egui::Stroke::new(3.0, egui::Color32::WHITE),
                             );
+                        }
+                        
+                        // Draw ripple effects
+                        for ripple in &ripples {
+                            let elapsed = ripple.start_time.elapsed().as_secs_f32();
+                            let progress = (elapsed / ripple.duration).min(1.0);
+                            
+                            // Convert projector coords to screen coords
+                            let screen_x = rect.min.x + ripple.center.0 * scale_x;
+                            let screen_y = rect.min.y + ripple.center.1 * scale_y;
+                            
+                            // Draw multiple concentric rings for wave effect
+                            let num_rings = 3;
+                            for i in 0..num_rings {
+                                let ring_offset = (i as f32 / num_rings as f32) * 0.3; // Spread rings
+                                let ring_progress = (progress - ring_offset).max(0.0).min(1.0);
+                                
+                                if ring_progress > 0.0 {
+                                    let ring_radius = ring_progress * ripple.max_radius * scale_x.min(scale_y);
+                                    let ring_alpha = ((1.0 - ring_progress) * 200.0) as u8;
+                                    
+                                    let color = egui::Color32::from_rgba_unmultiplied(
+                                        ripple.color.r(),
+                                        ripple.color.g(),
+                                        ripple.color.b(),
+                                        ring_alpha,
+                                    );
+                                    
+                                    // Stroke width decreases as ring expands
+                                    let stroke_width = (1.0 - ring_progress) * 4.0 + 1.0;
+                                    
+                                    ui.painter().circle_stroke(
+                                        egui::pos2(screen_x, screen_y),
+                                        ring_radius,
+                                        egui::Stroke::new(stroke_width, color),
+                                    );
+                                }
+                            }
                         }
                     }
                 }

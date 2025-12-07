@@ -110,6 +110,37 @@ impl HandLandmarks {
             .map(|lm| (lm.x * image_width, lm.y * image_height))
             .collect()
     }
+
+    /// Check if thumb and index finger are pinching (close together)
+    /// Returns Some((x, y)) with the pinch center position (normalized 0-1) if pinching,
+    /// or None if not pinching
+    pub fn detect_pinch(&self, threshold: f32) -> Option<(f32, f32)> {
+        let thumb_tip = &self.landmarks[landmarks::THUMB_TIP];
+        let index_tip = &self.landmarks[landmarks::INDEX_FINGER_TIP];
+        
+        let dx = thumb_tip.x - index_tip.x;
+        let dy = thumb_tip.y - index_tip.y;
+        let distance = (dx * dx + dy * dy).sqrt();
+        
+        if distance < threshold {
+            // Return the midpoint between thumb and index as pinch center
+            let center_x = (thumb_tip.x + index_tip.x) / 2.0;
+            let center_y = (thumb_tip.y + index_tip.y) / 2.0;
+            Some((center_x, center_y))
+        } else {
+            None
+        }
+    }
+
+    /// Get the distance between thumb tip and index finger tip (normalized)
+    pub fn thumb_index_distance(&self) -> f32 {
+        let thumb_tip = &self.landmarks[landmarks::THUMB_TIP];
+        let index_tip = &self.landmarks[landmarks::INDEX_FINGER_TIP];
+        
+        let dx = thumb_tip.x - index_tip.x;
+        let dy = thumb_tip.y - index_tip.y;
+        (dx * dx + dy * dy).sqrt()
+    }
 }
 
 /// JSON structures for parsing Python output
