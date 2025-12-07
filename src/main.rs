@@ -126,8 +126,18 @@ fn generate_image_with_gemini(api_token: &str, prompt: &str) -> Result<Vec<u8>, 
                             if inline_data.mime_type.starts_with("image/") {
                                 let image_bytes = BASE64.decode(&inline_data.data)
                                     .map_err(|e| format!("Failed to decode image: {}", e))?;
-                                log::info!("Successfully generated image ({} bytes)", image_bytes.len());
-                                return Ok(image_bytes);
+                                log::info!("Successfully generated image ({} bytes, mime: {})", 
+                                    image_bytes.len(), inline_data.mime_type);
+                                
+                                // Convert to PNG using image crate for consistent format
+                                let img = image::load_from_memory(&image_bytes)
+                                    .map_err(|e| format!("Failed to decode image data: {}", e))?;
+                                let mut png_bytes = Vec::new();
+                                img.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+                                    .map_err(|e| format!("Failed to encode as PNG: {}", e))?;
+                                
+                                log::info!("Converted to PNG ({} bytes)", png_bytes.len());
+                                return Ok(png_bytes);
                             }
                         }
                     }
@@ -1097,6 +1107,13 @@ impl FingerTrackerApp {
         // Clear the texture so it gets recreated with new image
         self.background_texture = None;
     }
+    
+    /// Load default background image
+    fn load_default_background(&mut self) {
+        self.background_image = Self::load_background_image("assets/cave-map.jpg");
+        // Clear the texture so it gets recreated with new image
+        self.background_texture = None;
+    }
 }
 
 fn options_viewport_id() -> egui::ViewportId {
@@ -1139,6 +1156,7 @@ impl eframe::App for FingerTrackerApp {
             let image_gen_status = self.image_gen_status.clone();
             let gemini_api_token = self.gemini_api_token.clone();
             let reload_background = Arc::new(Mutex::new(false));
+            let use_default_background = Arc::new(Mutex::new(false));
 
             // Clone Arcs for the closure
             let show_camera_feed_c = show_camera_feed.clone();
@@ -1151,6 +1169,7 @@ impl eframe::App for FingerTrackerApp {
             let image_gen_prompt_c = image_gen_prompt.clone();
             let image_gen_status_c = image_gen_status.clone();
             let reload_background_c = reload_background.clone();
+            let use_default_background_c = use_default_background.clone();
 
             ctx.show_viewport_immediate(
                 options_viewport_id(),
@@ -1673,6 +1692,13 @@ impl eframe::App for FingerTrackerApp {
                             ui.separator();
                             ui.heading("🎨 Image Generation");
                             
+                            // Button to use default background
+                            if ui.button("🗺️ Use Default Background").clicked() {
+                                *use_default_background_c.lock().unwrap() = true;
+                            }
+                            
+                            ui.add_space(8.0);
+                            
                             // Check API token status
                             if gemini_api_token.is_none() {
                                 ui.colored_label(egui::Color32::RED, "⚠️ No API token found");
@@ -1736,9 +1762,14 @@ impl eframe::App for FingerTrackerApp {
                                     }
                                     ImageGenStatus::Success(path) => {
                                         ui.colored_label(egui::Color32::GREEN, format!("✓ Image saved to {}", path));
-                                        if ui.button("Generate Another").clicked() {
-                                            *image_gen_status_c.lock().unwrap() = ImageGenStatus::Idle;
-                                        }
+                                        ui.horizontal(|ui| {
+                                            if ui.button("🖼️ Use as Background").clicked() {
+                                                *reload_background_c.lock().unwrap() = true;
+                                            }
+                                            if ui.button("Generate Another").clicked() {
+                                                *image_gen_status_c.lock().unwrap() = ImageGenStatus::Idle;
+                                            }
+                                        });
                                     }
                                     ImageGenStatus::Error(err) => {
                                         ui.colored_label(egui::Color32::RED, format!("✗ Error: {}", err));
@@ -1788,6 +1819,12 @@ impl eframe::App for FingerTrackerApp {
             if *reload_background.lock().unwrap() {
                 *reload_background.lock().unwrap() = false;
                 self.reload_background();
+            }
+            
+            // Check if we need to use the default background
+            if *use_default_background.lock().unwrap() {
+                *use_default_background.lock().unwrap() = false;
+                self.load_default_background();
             }
         }
 
