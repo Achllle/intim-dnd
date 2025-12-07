@@ -32,6 +32,19 @@ const HOMOGRAPHY: [[f64; 3]; 3] = [
     [0.0, 0.0, 1.0],    // No perspective distortion
 ];
 
+/// Region of interest in camera coordinates (computed from calibration corner points)
+#[derive(Clone, Copy, Debug)]
+struct CameraRoi {
+    /// Top-left corner X
+    x: i32,
+    /// Top-left corner Y
+    y: i32,
+    /// Width of ROI
+    width: i32,
+    /// Height of ROI
+    height: i32,
+}
+
 /// Get the path to the homography calibration file
 fn get_homography_file_path() -> PathBuf {
     // Store in user's config directory or current directory
@@ -41,6 +54,17 @@ fn get_homography_file_path() -> PathBuf {
         app_dir.join("homography.txt")
     } else {
         PathBuf::from("homography.txt")
+    }
+}
+
+/// Get the path to the camera ROI calibration file
+fn get_roi_file_path() -> PathBuf {
+    if let Some(config_dir) = dirs::config_dir() {
+        let app_dir = config_dir.join("finger_tracker");
+        let _ = fs::create_dir_all(&app_dir);
+        app_dir.join("camera_roi.txt")
+    } else {
+        PathBuf::from("camera_roi.txt")
     }
 }
 
@@ -60,6 +84,16 @@ fn save_homography(h: &Matrix3<f64>) -> Result<(), String> {
     fs::write(&path, content)
         .map_err(|e| format!("Failed to save homography to {:?}: {}", path, e))?;
     log::info!("Saved homography to {:?}", path);
+    Ok(())
+}
+
+/// Save camera ROI to file
+fn save_camera_roi(roi: &CameraRoi) -> Result<(), String> {
+    let path = get_roi_file_path();
+    let content = format!("{} {} {} {}\n", roi.x, roi.y, roi.width, roi.height);
+    fs::write(&path, content)
+        .map_err(|e| format!("Failed to save camera ROI to {:?}: {}", path, e))?;
+    log::info!("Saved camera ROI to {:?}", path);
     Ok(())
 }
 
@@ -89,6 +123,30 @@ fn load_homography() -> Option<[[f64; 3]; 3]> {
     
     log::info!("Loaded homography from {:?}", path);
     Some(h)
+}
+
+/// Load camera ROI from file
+fn load_camera_roi() -> Option<CameraRoi> {
+    let path = get_roi_file_path();
+    let content = fs::read_to_string(&path).ok()?;
+    let values: Vec<i32> = content
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    
+    if values.len() >= 4 {
+        let roi = CameraRoi {
+            x: values[0],
+            y: values[1],
+            width: values[2],
+            height: values[3],
+        };
+        log::info!("Loaded camera ROI from {:?}: {:?}", path, roi);
+        Some(roi)
+    } else {
+        log::warn!("Invalid camera ROI file format");
+        None
+    }
 }
 
 /// Finger detection parameters (adjust based on skin tone and lighting)
@@ -185,8 +243,13 @@ struct SharedState {
     debug_threshold_frame: Option<Vec<u8>>,
     /// Debug: skin-thresholded frame for finger detection visualization (grayscale as RGB)
     debug_skin_threshold_frame: Option<Vec<u8>>,
+    /// Dimensions of the skin threshold frame (may differ from full frame when using ROI)
+    debug_skin_threshold_width: u32,
+    debug_skin_threshold_height: u32,
     /// Brightness threshold for calibration dot detection
     calibration_brightness_threshold: u8,
+    /// Camera region of interest (computed from calibration corner points)
+    camera_roi: Option<CameraRoi>,
 }
 
 impl Default for CalibrationData {
@@ -267,6 +330,8 @@ impl SharedState {
         // Try to load saved homography, fall back to default
         let h = load_homography().unwrap_or(HOMOGRAPHY);
         let homography = Matrix3::from_row_slice(&h.concat());
+        // Try to load saved camera ROI
+        let camera_roi = load_camera_roi();
         Self {
             frame: None,
             frame_width: 640,
@@ -279,7 +344,10 @@ impl SharedState {
             calibration: CalibrationData::default(),
             debug_threshold_frame: None,
             debug_skin_threshold_frame: None,
+            debug_skin_threshold_width: 640,
+            debug_skin_threshold_height: 480,
             calibration_brightness_threshold: 200,
+            camera_roi,
         }
     }
 
@@ -364,7 +432,58 @@ impl SharedState {
         }
 
         self.set_homography(h);
+        
+        // Compute camera ROI from the bounding box of calibration camera points
+        self.compute_camera_roi();
+        
         Ok(())
+    }
+    
+    /// Compute camera ROI from calibration points (bounding box of detected corners)
+    fn compute_camera_roi(&mut self) {
+        if self.calibration.camera_points.len() < 4 {
+            self.camera_roi = None;
+            return;
+        }
+        
+        // Find bounding box of all camera calibration points
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        
+        for (x, y) in &self.calibration.camera_points {
+            min_x = min_x.min(*x);
+            min_y = min_y.min(*y);
+            max_x = max_x.max(*x);
+            max_y = max_y.max(*y);
+        }
+        
+        // Add a small margin (5% on each side) to ensure we capture the full area
+        let width = max_x - min_x;
+        let height = max_y - min_y;
+        let margin_x = width * 0.05;
+        let margin_y = height * 0.05;
+        
+        // Clamp to frame bounds
+        let x = (min_x - margin_x).max(0.0) as i32;
+        let y = (min_y - margin_y).max(0.0) as i32;
+        let roi_width = ((max_x - min_x) + 2.0 * margin_x) as i32;
+        let roi_height = ((max_y - min_y) + 2.0 * margin_y) as i32;
+        
+        // Ensure minimum size
+        if roi_width > 50 && roi_height > 50 {
+            self.camera_roi = Some(CameraRoi {
+                x,
+                y,
+                width: roi_width,
+                height: roi_height,
+            });
+            log::info!("Camera ROI set to: x={}, y={}, w={}, h={}", x, y, roi_width, roi_height);
+        } else {
+            self.camera_roi = None;
+            log::warn!("Computed ROI too small, using full frame");
+        }
     }
 }
 
@@ -663,12 +782,60 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
                     let state = state.lock().unwrap();
                     matches!(state.calibration.state, CalibrationState::CapturingDot { .. })
                 };
+                
+                // Get camera ROI for cropping (if calibrated)
+                let camera_roi = {
+                    let state = state.lock().unwrap();
+                    state.camera_roi
+                };
 
-                // Detect finger tip (when not calibrating) or calibration dot
-                let (finger_tip, skin_threshold_frame) = if !is_calibrating {
-                    detect_finger_tip(&frame, &params).unwrap_or((None, None))
+                // Detect finger tip (when not calibrating) using ROI-cropped frame if available
+                // Returns (finger_tip, skin_threshold_frame, thresh_width, thresh_height)
+                let (finger_tip, skin_threshold_frame, skin_thresh_w, skin_thresh_h) = if !is_calibrating {
+                    // Get frame dimensions for bounds checking
+                    let frame_size = frame.size().unwrap_or(Size::new(640, 480));
+                    
+                    if let Some(roi) = camera_roi {
+                        // Clamp ROI to frame bounds
+                        let roi_x = roi.x.max(0).min(frame_size.width - 1);
+                        let roi_y = roi.y.max(0).min(frame_size.height - 1);
+                        let roi_w = roi.width.min(frame_size.width - roi_x);
+                        let roi_h = roi.height.min(frame_size.height - roi_y);
+                        
+                        if roi_w > 10 && roi_h > 10 {
+                            // Create ROI rectangle and crop the frame
+                            let roi_rect = core::Rect::new(roi_x, roi_y, roi_w, roi_h);
+                            if let Ok(cropped_ref) = Mat::roi(&frame, roi_rect) {
+                                // Clone the ROI to get an owned Mat
+                                let mut cropped = Mat::default();
+                                if cropped_ref.copy_to(&mut cropped).is_ok() {
+                                    // Detect finger in cropped frame
+                                    let (tip, thresh) = detect_finger_tip(&cropped, &params).unwrap_or((None, None));
+                                    // Offset the detected position back to full frame coordinates
+                                    let offset_tip = tip.map(|(x, y)| (x + roi_x as f32, y + roi_y as f32));
+                                    (offset_tip, thresh, roi_w as u32, roi_h as u32)
+                                } else {
+                                    // Copy failed, use full frame
+                                    let (tip, thresh) = detect_finger_tip(&frame, &params).unwrap_or((None, None));
+                                    (tip, thresh, frame_size.width as u32, frame_size.height as u32)
+                                }
+                            } else {
+                                // ROI extraction failed, use full frame
+                                let (tip, thresh) = detect_finger_tip(&frame, &params).unwrap_or((None, None));
+                                (tip, thresh, frame_size.width as u32, frame_size.height as u32)
+                            }
+                        } else {
+                            // ROI too small, use full frame
+                            let (tip, thresh) = detect_finger_tip(&frame, &params).unwrap_or((None, None));
+                            (tip, thresh, frame_size.width as u32, frame_size.height as u32)
+                        }
+                    } else {
+                        // No ROI, use full frame
+                        let (tip, thresh) = detect_finger_tip(&frame, &params).unwrap_or((None, None));
+                        (tip, thresh, frame_size.width as u32, frame_size.height as u32)
+                    }
                 } else {
-                    (None, None)
+                    (None, None, 640, 480)
                 };
                 
                 // Get calibration brightness threshold
@@ -711,6 +878,8 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
                     state.calibration.detected_dot = calibration_dot;
                     state.debug_threshold_frame = threshold_frame;
                     state.debug_skin_threshold_frame = skin_threshold_frame;
+                    state.debug_skin_threshold_width = skin_thresh_w;
+                    state.debug_skin_threshold_height = skin_thresh_h;
                     
                     // Only accumulate positions during capture phase
                     if matches!(state.calibration.state, CalibrationState::CapturingDot { .. }) {
@@ -1072,7 +1241,7 @@ impl eframe::App for FingerTrackerApp {
                             
                             // Debug views - raw camera and threshold side by side
                             ui.add_space(8.0);
-                            let (frame_data, threshold_data, skin_threshold_data, frame_w, frame_h, detected_pt, finger_tip) = {
+                            let (frame_data, threshold_data, skin_threshold_data, frame_w, frame_h, skin_w, skin_h, detected_pt, finger_tip) = {
                                 let state_lock = state.lock().unwrap();
                                 (
                                     state_lock.frame.clone(),
@@ -1080,6 +1249,8 @@ impl eframe::App for FingerTrackerApp {
                                     state_lock.debug_skin_threshold_frame.clone(),
                                     state_lock.frame_width,
                                     state_lock.frame_height,
+                                    state_lock.debug_skin_threshold_width,
+                                    state_lock.debug_skin_threshold_height,
                                     state_lock.calibration.detected_dot,
                                     state_lock.finger_tip_camera,
                                 )
@@ -1207,13 +1378,20 @@ impl eframe::App for FingerTrackerApp {
                                 ui.add_space(8.0);
                                 
                                 // Skin threshold view with fingertip indicator
+                                // Note: This may be cropped to the ROI, so use skin_w/skin_h
                                 ui.vertical(|ui| {
                                     ui.label("Skin Threshold:");
+                                    let skin_width = skin_w as usize;
+                                    let skin_height = skin_h as usize;
+                                    let skin_expected_size = skin_width * skin_height * 3;
+                                    let skin_aspect = skin_height as f32 / skin_width as f32;
+                                    let skin_display_height = display_width * skin_aspect;
+                                    
                                     if let Some(data) = &skin_threshold_data {
-                                        if data.len() >= expected_size {
+                                        if data.len() >= skin_expected_size {
                                             let image = egui::ColorImage::from_rgb(
-                                                [width, height],
-                                                &data[..expected_size],
+                                                [skin_width, skin_height],
+                                                &data[..skin_expected_size],
                                             );
                                             
                                             let texture: egui::TextureHandle = ctx.load_texture(
@@ -1223,7 +1401,7 @@ impl eframe::App for FingerTrackerApp {
                                             );
                                             
                                             let (rect, _response) = ui.allocate_exact_size(
-                                                egui::vec2(display_width, display_height),
+                                                egui::vec2(display_width, skin_display_height),
                                                 egui::Sense::hover(),
                                             );
                                             
@@ -1235,11 +1413,20 @@ impl eframe::App for FingerTrackerApp {
                                             );
                                             
                                             // Draw fingertip position on skin threshold view
+                                            // Note: finger_tip is in full-frame coords, need to offset for ROI
                                             if let Some((fx, fy)) = finger_tip {
-                                                let scale_x = display_width / width as f32;
-                                                let scale_y = display_height / height as f32;
-                                                let screen_x = rect.min.x + fx * scale_x;
-                                                let screen_y = rect.min.y + fy * scale_y;
+                                                // Get ROI offset to convert full-frame coords to ROI coords
+                                                let roi_offset = {
+                                                    let state_lock = state.lock().unwrap();
+                                                    state_lock.camera_roi.map(|r| (r.x as f32, r.y as f32)).unwrap_or((0.0, 0.0))
+                                                };
+                                                let local_x = fx - roi_offset.0;
+                                                let local_y = fy - roi_offset.1;
+                                                
+                                                let scale_x = display_width / skin_width as f32;
+                                                let scale_y = skin_display_height / skin_height as f32;
+                                                let screen_x = rect.min.x + local_x * scale_x;
+                                                let screen_y = rect.min.y + local_y * scale_y;
                                                 
                                                 // Draw circle at fingertip
                                                 ui.painter().circle_stroke(
@@ -1258,7 +1445,8 @@ impl eframe::App for FingerTrackerApp {
                                                 );
                                             }
                                         } else {
-                                            ui.colored_label(egui::Color32::GRAY, "Size mismatch");
+                                            ui.colored_label(egui::Color32::GRAY, 
+                                                format!("Size mismatch: {} vs {}", data.len(), skin_expected_size));
                                         }
                                     } else {
                                         ui.colored_label(egui::Color32::GRAY, "No data");
@@ -1276,6 +1464,15 @@ impl eframe::App for FingerTrackerApp {
                             }
                             if let Some(proj_pt) = state_lock.finger_tip_projector {
                                 ui.label(format!("Projector: ({:.1}, {:.1})", proj_pt.0, proj_pt.1));
+                            }
+                            
+                            // Show camera ROI status
+                            ui.add_space(4.0);
+                            if let Some(roi) = &state_lock.camera_roi {
+                                ui.colored_label(egui::Color32::GREEN, 
+                                    format!("ROI: {}x{} at ({}, {})", roi.width, roi.height, roi.x, roi.y));
+                            } else {
+                                ui.colored_label(egui::Color32::YELLOW, "ROI: Not calibrated (using full frame)");
                             }
                         });
                     });
@@ -1513,6 +1710,12 @@ impl eframe::App for FingerTrackerApp {
                                 // Save the new homography to file
                                 if let Err(e) = save_homography(&state.homography) {
                                     log::error!("Failed to save homography: {}", e);
+                                }
+                                // Save the camera ROI to file
+                                if let Some(ref roi) = state.camera_roi {
+                                    if let Err(e) = save_camera_roi(roi) {
+                                        log::error!("Failed to save camera ROI: {}", e);
+                                    }
                                 }
                                 state.calibration.state = CalibrationState::Complete {
                                     success: true,
