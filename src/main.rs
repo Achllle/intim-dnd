@@ -1246,7 +1246,7 @@ impl FingerTrackerApp {
             image_gen_status: Arc::new(Mutex::new(ImageGenStatus::Idle)),
             generated_images: Arc::new(Mutex::new(generated_images)),
             selected_image_index: Arc::new(Mutex::new(None)),
-            show_grid: false,
+            show_grid: true,
             grid_rows: default_grid_rows,
             characters: Arc::new(Mutex::new(characters)),
         }
