@@ -8,6 +8,8 @@ use opencv::{
     prelude::*,
     videoio::{self, VideoCapture, CAP_V4L2},
 };
+use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,6 +31,65 @@ const HOMOGRAPHY: [[f64; 3]; 3] = [
     [0.0, 2.25, 0.0],   // Scale Y by 2.25 (480 camera -> 1080 projector)
     [0.0, 0.0, 1.0],    // No perspective distortion
 ];
+
+/// Get the path to the homography calibration file
+fn get_homography_file_path() -> PathBuf {
+    // Store in user's config directory or current directory
+    if let Some(config_dir) = dirs::config_dir() {
+        let app_dir = config_dir.join("finger_tracker");
+        let _ = fs::create_dir_all(&app_dir);
+        app_dir.join("homography.txt")
+    } else {
+        PathBuf::from("homography.txt")
+    }
+}
+
+/// Save homography matrix to file
+fn save_homography(h: &Matrix3<f64>) -> Result<(), String> {
+    let path = get_homography_file_path();
+    let mut content = String::new();
+    for row in 0..3 {
+        for col in 0..3 {
+            content.push_str(&format!("{}", h[(row, col)]));
+            if col < 2 {
+                content.push(' ');
+            }
+        }
+        content.push('\n');
+    }
+    fs::write(&path, content)
+        .map_err(|e| format!("Failed to save homography to {:?}: {}", path, e))?;
+    log::info!("Saved homography to {:?}", path);
+    Ok(())
+}
+
+/// Load homography matrix from file
+fn load_homography() -> Option<[[f64; 3]; 3]> {
+    let path = get_homography_file_path();
+    let content = fs::read_to_string(&path).ok()?;
+    let mut h = [[0.0f64; 3]; 3];
+    
+    for (row_idx, line) in content.lines().enumerate() {
+        if row_idx >= 3 {
+            break;
+        }
+        let values: Vec<f64> = line
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if values.len() >= 3 {
+            h[row_idx][0] = values[0];
+            h[row_idx][1] = values[1];
+            h[row_idx][2] = values[2];
+        } else {
+            log::warn!("Invalid homography file format at line {}", row_idx);
+            return None;
+        }
+    }
+    
+    log::info!("Loaded homography from {:?}", path);
+    Some(h)
+}
 
 /// Finger detection parameters (adjust based on skin tone and lighting)
 #[derive(Clone)]
@@ -201,7 +262,9 @@ fn compute_robust_position(positions: &[(f32, f32)], outlier_threshold: f32) -> 
 
 impl SharedState {
     fn new() -> Self {
-        let homography = Matrix3::from_row_slice(&HOMOGRAPHY.concat());
+        // Try to load saved homography, fall back to default
+        let h = load_homography().unwrap_or(HOMOGRAPHY);
+        let homography = Matrix3::from_row_slice(&h.concat());
         Self {
             frame: None,
             frame_width: 640,
@@ -683,6 +746,16 @@ struct FingerTrackerApp {
 
 impl FingerTrackerApp {
     fn new(state: Arc<Mutex<SharedState>>) -> Self {
+        // Get the homography from state (may have been loaded from file)
+        let homography_edit = {
+            let state_lock = state.lock().unwrap();
+            let h = state_lock.homography;
+            [
+                [h[(0, 0)], h[(0, 1)], h[(0, 2)]],
+                [h[(1, 0)], h[(1, 1)], h[(1, 2)]],
+                [h[(2, 0)], h[(2, 1)], h[(2, 2)]],
+            ]
+        };
         Self {
             state,
             texture: None,
@@ -691,7 +764,7 @@ impl FingerTrackerApp {
             circle_color: egui::Color32::from_rgb(255, 100, 100),
             projector_width: 1920.0,
             projector_height: 1080.0,
-            homography_edit: HOMOGRAPHY,
+            homography_edit,
             show_options_window: true,
         }
     }
@@ -1362,10 +1435,14 @@ impl eframe::App for FingerTrackerApp {
                         let mut state = self.state.lock().unwrap();
                         match state.compute_homography() {
                             Ok(()) => {
+                                // Save the new homography to file
+                                if let Err(e) = save_homography(&state.homography) {
+                                    log::error!("Failed to save homography: {}", e);
+                                }
                                 state.calibration.state = CalibrationState::Complete {
                                     success: true,
                                     message: format!(
-                                        "Successfully computed homography from {} points",
+                                        "Successfully computed homography from {} points (saved)",
                                         state.calibration.camera_points.len()
                                     ),
                                 };
