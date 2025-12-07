@@ -1077,6 +1077,10 @@ struct FingerTrackerApp {
     generated_images: Arc<Mutex<Vec<GeneratedImage>>>,
     /// Currently selected image index in gallery
     selected_image_index: Arc<Mutex<Option<usize>>>,
+    /// Whether to show grid overlay
+    show_grid: bool,
+    /// Number of rows in the grid (5-14)
+    grid_rows: u32,
 }
 
 impl FingerTrackerApp {
@@ -1118,6 +1122,8 @@ impl FingerTrackerApp {
             image_gen_status: Arc::new(Mutex::new(ImageGenStatus::Idle)),
             generated_images: Arc::new(Mutex::new(generated_images)),
             selected_image_index: Arc::new(Mutex::new(None)),
+            show_grid: false,
+            grid_rows: 10,
         }
     }
     
@@ -1262,6 +1268,8 @@ impl eframe::App for FingerTrackerApp {
             let selected_image_index = self.selected_image_index.clone();
             let load_selected_image = Arc::new(Mutex::new(false));
             let selected_image_path = Arc::new(Mutex::new(None::<PathBuf>));
+            let show_grid = Arc::new(Mutex::new(self.show_grid));
+            let grid_rows = Arc::new(Mutex::new(self.grid_rows));
 
             // Clone Arcs for the closure
             let show_camera_feed_c = show_camera_feed.clone();
@@ -1278,6 +1286,8 @@ impl eframe::App for FingerTrackerApp {
             let selected_image_index_c = selected_image_index.clone();
             let load_selected_image_c = load_selected_image.clone();
             let selected_image_path_c = selected_image_path.clone();
+            let show_grid_c = show_grid.clone();
+            let grid_rows_c = grid_rows.clone();
 
             ctx.show_viewport_immediate(
                 options_viewport_id(),
@@ -1316,6 +1326,17 @@ impl eframe::App for FingerTrackerApp {
                                     egui::color_picker::Alpha::Opaque,
                                 );
                             });
+
+                            ui.separator();
+                            ui.heading("Grid Overlay");
+                            {
+                                let mut show = show_grid_c.lock().unwrap();
+                                ui.checkbox(&mut *show, "Show Grid");
+                            }
+                            {
+                                let mut rows = grid_rows_c.lock().unwrap();
+                                ui.add(egui::Slider::new(&mut *rows, 5..=14).text("Grid Rows"));
+                            }
 
                             ui.separator();
                             ui.heading("Projector Dimensions");
@@ -2040,6 +2061,8 @@ impl eframe::App for FingerTrackerApp {
             self.homography_edit = *homography_edit.lock().unwrap();
             self.show_options_window = *show_options.lock().unwrap();
             self.image_gen_prompt = image_gen_prompt.lock().unwrap().clone();
+            self.show_grid = *show_grid.lock().unwrap();
+            self.grid_rows = *grid_rows.lock().unwrap();
             
             // Check if we need to use the default background
             if *use_default_background.lock().unwrap() {
@@ -2194,6 +2217,38 @@ impl eframe::App for FingerTrackerApp {
                 } else {
                     // Fallback to black background
                     ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+                }
+                
+                // Draw grid overlay if enabled
+                if self.show_grid {
+                    let grid_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100);
+                    let stroke = egui::Stroke::new(1.0, grid_color);
+                    
+                    // Calculate cell size based on row count (square cells)
+                    let cell_size = rect.height() / self.grid_rows as f32;
+                    let num_cols = (rect.width() / cell_size).ceil() as u32;
+                    
+                    // Draw horizontal lines
+                    for row in 0..=self.grid_rows {
+                        let y = rect.min.y + row as f32 * cell_size;
+                        if y <= rect.max.y {
+                            ui.painter().line_segment(
+                                [egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)],
+                                stroke,
+                            );
+                        }
+                    }
+                    
+                    // Draw vertical lines
+                    for col in 0..=num_cols {
+                        let x = rect.min.x + col as f32 * cell_size;
+                        if x <= rect.max.x {
+                            ui.painter().line_segment(
+                                [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+                                stroke,
+                            );
+                        }
+                    }
                 }
                 
                 // Scale factors for projector to screen conversion
