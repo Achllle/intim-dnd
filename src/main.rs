@@ -649,11 +649,11 @@ struct SharedState {
     calibration: CalibrationData,
     /// Debug: thresholded frame for calibration visualization (grayscale as RGB)
     debug_threshold_frame: Option<Vec<u8>>,
-    /// Debug: skin-thresholded frame for finger detection visualization (grayscale as RGB)
-    debug_skin_threshold_frame: Option<Vec<u8>>,
-    /// Dimensions of the skin threshold frame (may differ from full frame when using ROI)
-    debug_skin_threshold_width: u32,
-    debug_skin_threshold_height: u32,
+    /// Debug: cropped region frame for hand tracking visualization
+    debug_hand_tracking_frame: Option<Vec<u8>>,
+    /// Dimensions of the hand tracking cropped frame (may differ from full frame when using ROI)
+    debug_hand_tracking_width: u32,
+    debug_hand_tracking_height: u32,
     /// Brightness threshold for calibration dot detection
     calibration_brightness_threshold: u8,
     /// Camera region of interest (computed from calibration corner points)
@@ -756,9 +756,9 @@ impl SharedState {
             running: true,
             calibration: CalibrationData::default(),
             debug_threshold_frame: None,
-            debug_skin_threshold_frame: None,
-            debug_skin_threshold_width: 640,
-            debug_skin_threshold_height: 480,
+            debug_hand_tracking_frame: None,
+            debug_hand_tracking_width: 640,
+            debug_hand_tracking_height: 480,
             calibration_brightness_threshold: 200,
             camera_roi,
             hand_landmarks: None,
@@ -1209,9 +1209,9 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
                     // Update calibration dot detection and debug frame
                     state.calibration.detected_dot = calibration_dot;
                     state.debug_threshold_frame = threshold_frame;
-                    state.debug_skin_threshold_frame = debug_frame;
-                    state.debug_skin_threshold_width = debug_w;
-                    state.debug_skin_threshold_height = debug_h;
+                    state.debug_hand_tracking_frame = debug_frame;
+                    state.debug_hand_tracking_width = debug_w;
+                    state.debug_hand_tracking_height = debug_h;
                     
                     // Update hand landmarks (for ML mode visualization)
                     state.hand_landmarks = hand_landmarks;
@@ -1306,6 +1306,8 @@ struct IntImDnDApp {
     hover_state: Option<(usize, Instant)>,
     /// Info panel state: character to show info for and when to hide
     info_panel_state: Option<(usize, Instant)>,
+    /// Whether to show the calibration settings window
+    show_calibration_window: bool,
 }
 
 impl IntImDnDApp {
@@ -1383,6 +1385,7 @@ impl IntImDnDApp {
             hover_info_display_ms: settings.hover_info_display_ms,
             hover_state: None,
             info_panel_state: None,
+            show_calibration_window: false,
         }
     }
     
@@ -1600,6 +1603,10 @@ fn options_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("options_viewport")
 }
 
+fn calibration_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("calibration_viewport")
+}
+
 impl eframe::App for IntImDnDApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Request continuous repaint for real-time updates
@@ -1649,6 +1656,7 @@ impl eframe::App for IntImDnDApp {
             let drop_confirm_ms = Arc::new(Mutex::new(self.drop_confirm_ms));
             let hover_show_info_ms = Arc::new(Mutex::new(self.hover_show_info_ms));
             let hover_info_display_ms = Arc::new(Mutex::new(self.hover_info_display_ms));
+            let show_calibration_window = Arc::new(Mutex::new(self.show_calibration_window));
 
             // Clone Arcs for the closure
             let show_camera_feed_c = show_camera_feed.clone();
@@ -1656,7 +1664,7 @@ impl eframe::App for IntImDnDApp {
             let circle_color_c = circle_color.clone();
             let projector_width_c = projector_width.clone();
             let projector_height_c = projector_height.clone();
-            let homography_edit_c = homography_edit.clone();
+            let _homography_edit_c = homography_edit.clone();
             let show_options_c = show_options.clone();
             let image_gen_prompt_c = image_gen_prompt.clone();
             let image_gen_status_c = image_gen_status.clone();
@@ -1674,6 +1682,7 @@ impl eframe::App for IntImDnDApp {
             let drop_confirm_ms_c = drop_confirm_ms.clone();
             let hover_show_info_ms_c = hover_show_info_ms.clone();
             let hover_info_display_ms_c = hover_info_display_ms.clone();
+            let show_calibration_window_c = show_calibration_window.clone();
 
             ctx.show_viewport_immediate(
                 options_viewport_id(),
@@ -1823,6 +1832,13 @@ impl eframe::App for IntImDnDApp {
                             }
 
                             ui.separator();
+                            ui.heading("🔧 Calibration");
+                            ui.small("Configure camera-to-projector mapping");
+                            if ui.button("Open Calibration Settings...").clicked() {
+                                *show_calibration_window_c.lock().unwrap() = true;
+                            }
+
+                            ui.separator();
                             ui.heading("ML Hand Tracking");
                             {
                                 let ml_available = hand_tracker::model_available();
@@ -1833,462 +1849,177 @@ impl eframe::App for IntImDnDApp {
                                     ui.small("Place hand_landmarker.task in ~/.config/intim-dnd/models/");
                                 }
                             }
-
-                            ui.separator();
-                            ui.heading("Homography Matrix");
-                            ui.label("Camera → Projector transform:");
                             
-                            let mut changed = false;
-                            {
-                                let mut homo = homography_edit_c.lock().unwrap();
-                                for row in 0..3 {
-                                    ui.horizontal(|ui| {
-                                        for col in 0..3 {
-                                            let resp = ui.add(
-                                                egui::DragValue::new(&mut homo[row][col])
-                                                    .speed(0.01)
-                                                    .fixed_decimals(3)
-                                            );
-                                            if resp.changed() {
-                                                changed = true;
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                            
-                            if changed {
-                                let homo = homography_edit_c.lock().unwrap();
-                                let mut state_lock = state.lock().unwrap();
-                                state_lock.set_homography(*homo);
-                            }
-
-                            ui.separator();
-                            ui.heading("Calibration");
-                            
-                            // Get calibration state for UI
-                            let (calib_state, num_points, total_points, detected_dot) = {
-                                let state_lock = state.lock().unwrap();
-                                (
-                                    state_lock.calibration.state.clone(),
-                                    state_lock.calibration.camera_points.len(),
-                                    state_lock.calibration.projector_points.len(),
-                                    state_lock.calibration.detected_dot,
-                                )
-                            };
-                            
-                            // Display calibration status
-                            match &calib_state {
-                                CalibrationState::Idle => {
-                                    ui.label("Status: Ready to calibrate");
-                                    if ui.button("🎯 Start Calibration").clicked() {
-                                        let proj_w = *projector_width_c.lock().unwrap();
-                                        let proj_h = *projector_height_c.lock().unwrap();
-                                        let mut state_lock = state.lock().unwrap();
-                                        state_lock.generate_calibration_points(proj_w, proj_h);
-                                        state_lock.calibration.state = CalibrationState::WaitingToStart;
-                                    }
-                                }
-                                CalibrationState::WaitingToStart => {
-                                    ui.colored_label(egui::Color32::YELLOW, 
-                                        "⚠️ Position projector window on projector display!");
-                                    ui.label("Switch main window to Projector Mode first.");
-                                    if ui.button("▶️ Begin Calibration").clicked() {
-                                        let mut state_lock = state.lock().unwrap();
-                                        state_lock.calibration.state = CalibrationState::DisplayingDot { 
-                                            index: 0, 
-                                            start_time: Instant::now() 
-                                        };
-                                    }
-                                    if ui.button("❌ Cancel").clicked() {
-                                        let mut state_lock = state.lock().unwrap();
-                                        state_lock.calibration.state = CalibrationState::Idle;
-                                    }
-                                }
-                                CalibrationState::DisplayingDot { index, .. } => {
-                                    ui.colored_label(egui::Color32::GREEN, 
-                                        format!("Displaying dot {}/{}", index + 1, total_points));
-                                    ui.label("Waiting for dot to stabilize...");
-                                    if ui.button("❌ Cancel").clicked() {
-                                        let mut state_lock = state.lock().unwrap();
-                                        state_lock.calibration.state = CalibrationState::Idle;
-                                        state_lock.calibration.camera_points.clear();
-                                    }
-                                }
-                                CalibrationState::CapturingDot { index, .. } => {
-                                    ui.colored_label(egui::Color32::LIGHT_BLUE, 
-                                        format!("Capturing dot {}/{}", index + 1, total_points));
-                                    
-                                    // Show sample count
-                                    let (sample_count, min_samples) = {
-                                        let state_lock = state.lock().unwrap();
-                                        (state_lock.calibration.accumulated_positions.len(),
-                                         state_lock.calibration.minimum_samples)
-                                    };
-                                    ui.label(format!("Samples: {}/{}", sample_count, min_samples));
-                                    
-                                    if let Some((dx, dy)) = detected_dot {
-                                        ui.label(format!("Detected at: ({:.1}, {:.1})", dx, dy));
-                                    } else {
-                                        ui.colored_label(egui::Color32::RED, "⚠️ Dot not detected!");
-                                    }
-                                    if ui.button("❌ Cancel").clicked() {
-                                        let mut state_lock = state.lock().unwrap();
-                                        state_lock.calibration.state = CalibrationState::Idle;
-                                        state_lock.calibration.camera_points.clear();
-                                    }
-                                }
-                                CalibrationState::Computing => {
-                                    ui.colored_label(egui::Color32::YELLOW, "Computing homography...");
-                                }
-                                CalibrationState::Complete { success, message } => {
-                                    if *success {
-                                        ui.colored_label(egui::Color32::GREEN, "✅ Calibration complete!");
-                                        ui.label(message);
-                                    } else {
-                                        ui.colored_label(egui::Color32::RED, "❌ Calibration failed!");
-                                        ui.label(message);
-                                    }
-                                    if ui.button("OK").clicked() {
-                                        let mut state_lock = state.lock().unwrap();
-                                        state_lock.calibration.state = CalibrationState::Idle;
-                                        // Update the homography edit display
-                                        let h = state_lock.homography;
-                                        let mut homo = homography_edit_c.lock().unwrap();
-                                        for row in 0..3 {
-                                            for col in 0..3 {
-                                                homo[row][col] = h[(row, col)];
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            // Progress bar
-                            if total_points > 0 {
-                                let progress = num_points as f32 / total_points as f32;
-                                ui.add(egui::ProgressBar::new(progress)
-                                    .text(format!("{}/{} points", num_points, total_points)));
-                            }
-                            
-                            // Brightness threshold slider
-                            ui.add_space(4.0);
-                            {
-                                let mut state_lock = state.lock().unwrap();
-                                ui.add(egui::Slider::new(&mut state_lock.calibration_brightness_threshold, 50..=255)
-                                    .text("Brightness Threshold"));
-                            }
-                            
-                            // Debug views - raw camera and threshold side by side
+                            // Hand tracking preview (larger view)
                             ui.add_space(8.0);
-                            let (frame_data, threshold_data, skin_threshold_data, frame_w, frame_h, skin_w, skin_h, detected_pt, finger_tip, hand_landmarks) = {
+                            let (hand_frame_data, hand_w, hand_h, finger_tip, hand_landmarks) = {
                                 let state_lock = state.lock().unwrap();
                                 (
-                                    state_lock.frame.clone(),
-                                    state_lock.debug_threshold_frame.clone(),
-                                    state_lock.debug_skin_threshold_frame.clone(),
-                                    state_lock.frame_width,
-                                    state_lock.frame_height,
-                                    state_lock.debug_skin_threshold_width,
-                                    state_lock.debug_skin_threshold_height,
-                                    state_lock.calibration.detected_dot,
+                                    state_lock.debug_hand_tracking_frame.clone(),
+                                    state_lock.debug_hand_tracking_width,
+                                    state_lock.debug_hand_tracking_height,
                                     state_lock.finger_tip_camera,
                                     state_lock.hand_landmarks.clone(),
                                 )
                             };
                             
-                            let width = frame_w as usize;
-                            let height = frame_h as usize;
-                            let expected_size = width * height * 3;
+                            let hand_width = hand_w as usize;
+                            let hand_height = hand_h as usize;
+                            let hand_expected_size = hand_width * hand_height * 3;
+                            let hand_aspect = hand_height as f32 / hand_width as f32;
+                            let hand_display_width = 320.0;  // Larger display
+                            let hand_display_height = hand_display_width * hand_aspect;
                             
-                            // Display both views side by side
-                            let display_width = 160.0;
-                            let aspect = height as f32 / width as f32;
-                            let display_height = display_width * aspect;
-                            
-                            ui.horizontal(|ui| {
-                                // Raw camera feed
-                                ui.vertical(|ui| {
-                                    ui.label("Camera Feed:");
-                                    if let Some(data) = &frame_data {
-                                        if data.len() >= expected_size {
-                                            let image = egui::ColorImage::from_rgb(
-                                                [width, height],
-                                                &data[..expected_size],
-                                            );
+                            ui.vertical(|ui| {
+                                ui.label("Hand Tracking View:");
+                                if let Some(data) = &hand_frame_data {
+                                    if data.len() >= hand_expected_size {
+                                        let image = egui::ColorImage::from_rgb(
+                                            [hand_width, hand_height],
+                                            &data[..hand_expected_size],
+                                        );
+                                        
+                                        let texture: egui::TextureHandle = ctx.load_texture(
+                                            "debug_hand_tracking",
+                                            image,
+                                            egui::TextureOptions::LINEAR,
+                                        );
+                                        
+                                        let (rect, _response) = ui.allocate_exact_size(
+                                            egui::vec2(hand_display_width, hand_display_height),
+                                            egui::Sense::hover(),
+                                        );
+                                        
+                                        ui.painter().image(
+                                            texture.id(),
+                                            rect,
+                                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                            egui::Color32::WHITE,
+                                        );
+                                        
+                                        // Draw hand skeleton on the view
+                                        if let Some(landmarks) = &hand_landmarks {
+                                            let scale_x = hand_display_width / hand_width as f32;
+                                            let scale_y = hand_display_height / hand_height as f32;
                                             
-                                            let texture: egui::TextureHandle = ctx.load_texture(
-                                                "debug_camera",
-                                                image,
-                                                egui::TextureOptions::LINEAR,
-                                            );
-                                            
-                                            let (rect, _response) = ui.allocate_exact_size(
-                                                egui::vec2(display_width, display_height),
-                                                egui::Sense::hover(),
-                                            );
-                                            
-                                            ui.painter().image(
-                                                texture.id(),
-                                                rect,
-                                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                                                egui::Color32::WHITE,
-                                            );
-                                            
-                                            // Draw detected dot position on camera view too
-                                            if let Some((dx, dy)) = detected_pt {
-                                                let scale_x = display_width / width as f32;
-                                                let scale_y = display_height / height as f32;
-                                                let screen_x = rect.min.x + dx * scale_x;
-                                                let screen_y = rect.min.y + dy * scale_y;
-                                                
-                                                ui.painter().circle_stroke(
-                                                    egui::pos2(screen_x, screen_y),
-                                                    6.0,
-                                                    egui::Stroke::new(2.0, egui::Color32::GREEN),
-                                                );
-                                            }
-                                        } else {
-                                            ui.colored_label(egui::Color32::GRAY, "Size mismatch");
-                                        }
-                                    } else {
-                                        ui.colored_label(egui::Color32::GRAY, "No data");
-                                    }
-                                });
-                                
-                                ui.add_space(8.0);
-                                
-                                // Threshold debug view
-                                ui.vertical(|ui| {
-                                    ui.label("Threshold View:");
-                                    if let Some(data) = &threshold_data {
-                                        if data.len() >= expected_size {
-                                            let image = egui::ColorImage::from_rgb(
-                                                [width, height],
-                                                &data[..expected_size],
-                                            );
-                                            
-                                            let texture: egui::TextureHandle = ctx.load_texture(
-                                                "debug_threshold",
-                                                image,
-                                                egui::TextureOptions::LINEAR,
-                                            );
-                                            
-                                            let (rect, _response) = ui.allocate_exact_size(
-                                                egui::vec2(display_width, display_height),
-                                                egui::Sense::hover(),
-                                            );
-                                            
-                                            ui.painter().image(
-                                                texture.id(),
-                                                rect,
-                                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                                                egui::Color32::WHITE,
-                                            );
-                                            
-                                            // Draw detected dot position on threshold view
-                                            if let Some((dx, dy)) = detected_pt {
-                                                let scale_x = display_width / width as f32;
-                                                let scale_y = display_height / height as f32;
-                                                let screen_x = rect.min.x + dx * scale_x;
-                                                let screen_y = rect.min.y + dy * scale_y;
-                                                
-                                                // Draw crosshair at detected position
-                                                ui.painter().circle_stroke(
-                                                    egui::pos2(screen_x, screen_y),
-                                                    6.0,
-                                                    egui::Stroke::new(2.0, egui::Color32::RED),
-                                                );
-                                                ui.painter().line_segment(
-                                                    [egui::pos2(screen_x - 10.0, screen_y), egui::pos2(screen_x + 10.0, screen_y)],
-                                                    egui::Stroke::new(1.0, egui::Color32::RED),
-                                                );
-                                                ui.painter().line_segment(
-                                                    [egui::pos2(screen_x, screen_y - 10.0), egui::pos2(screen_x, screen_y + 10.0)],
-                                                    egui::Stroke::new(1.0, egui::Color32::RED),
-                                                );
-                                            }
-                                        } else {
-                                            ui.colored_label(egui::Color32::GRAY, "Size mismatch");
-                                        }
-                                    } else {
-                                        ui.colored_label(egui::Color32::GRAY, "No data");
-                                    }
-                                });
-                                
-                                ui.add_space(8.0);
-                                
-                                // Skin threshold view with fingertip indicator
-                                // Note: This may be cropped to the ROI, so use skin_w/skin_h
-                                ui.vertical(|ui| {
-                                    ui.label("Skin Threshold:");
-                                    let skin_width = skin_w as usize;
-                                    let skin_height = skin_h as usize;
-                                    let skin_expected_size = skin_width * skin_height * 3;
-                                    let skin_aspect = skin_height as f32 / skin_width as f32;
-                                    let skin_display_height = display_width * skin_aspect;
-                                    
-                                    if let Some(data) = &skin_threshold_data {
-                                        if data.len() >= skin_expected_size {
-                                            let image = egui::ColorImage::from_rgb(
-                                                [skin_width, skin_height],
-                                                &data[..skin_expected_size],
-                                            );
-                                            
-                                            let texture: egui::TextureHandle = ctx.load_texture(
-                                                "debug_skin_threshold",
-                                                image,
-                                                egui::TextureOptions::LINEAR,
-                                            );
-                                            
-                                            let (rect, _response) = ui.allocate_exact_size(
-                                                egui::vec2(display_width, skin_display_height),
-                                                egui::Sense::hover(),
-                                            );
-                                            
-                                            ui.painter().image(
-                                                texture.id(),
-                                                rect,
-                                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                                                egui::Color32::WHITE,
-                                            );
-                                            
-                                            // Draw hand skeleton on the debug view
-                                            // Hand landmarks are already in ROI-local coordinates
-                                            if let Some(landmarks) = &hand_landmarks {
-                                                let scale_x = display_width / skin_width as f32;
-                                                let scale_y = skin_display_height / skin_height as f32;
-                                                
-                                                // Helper to convert landmark to screen coordinates
-                                                let to_screen = |idx: usize| -> egui::Pos2 {
-                                                    if idx < landmarks.len() {
-                                                        let (lx, ly) = landmarks[idx];
-                                                        egui::pos2(
-                                                            rect.min.x + lx * scale_x,
-                                                            rect.min.y + ly * scale_y,
-                                                        )
-                                                    } else {
-                                                        egui::pos2(0.0, 0.0)
-                                                    }
-                                                };
-                                                
-                                                // Hand skeleton connections (MediaPipe format)
-                                                // Thumb: 0-1-2-3-4
-                                                // Index: 0-5-6-7-8
-                                                // Middle: 0-9-10-11-12
-                                                // Ring: 0-13-14-15-16
-                                                // Pinky: 0-17-18-19-20
-                                                // Palm: 5-9, 9-13, 13-17, 0-5, 0-17
-                                                let connections: &[(usize, usize, egui::Color32)] = &[
-                                                    // Thumb (orange)
-                                                    (0, 1, egui::Color32::from_rgb(255, 165, 0)),
-                                                    (1, 2, egui::Color32::from_rgb(255, 165, 0)),
-                                                    (2, 3, egui::Color32::from_rgb(255, 165, 0)),
-                                                    (3, 4, egui::Color32::from_rgb(255, 165, 0)),
-                                                    // Index (green)
-                                                    (0, 5, egui::Color32::GREEN),
-                                                    (5, 6, egui::Color32::GREEN),
-                                                    (6, 7, egui::Color32::GREEN),
-                                                    (7, 8, egui::Color32::GREEN),
-                                                    // Middle (cyan)
-                                                    (0, 9, egui::Color32::LIGHT_BLUE),
-                                                    (9, 10, egui::Color32::LIGHT_BLUE),
-                                                    (10, 11, egui::Color32::LIGHT_BLUE),
-                                                    (11, 12, egui::Color32::LIGHT_BLUE),
-                                                    // Ring (magenta)
-                                                    (0, 13, egui::Color32::from_rgb(255, 0, 255)),
-                                                    (13, 14, egui::Color32::from_rgb(255, 0, 255)),
-                                                    (14, 15, egui::Color32::from_rgb(255, 0, 255)),
-                                                    (15, 16, egui::Color32::from_rgb(255, 0, 255)),
-                                                    // Pinky (red)
-                                                    (0, 17, egui::Color32::RED),
-                                                    (17, 18, egui::Color32::RED),
-                                                    (18, 19, egui::Color32::RED),
-                                                    (19, 20, egui::Color32::RED),
-                                                    // Palm connections (white)
-                                                    (5, 9, egui::Color32::WHITE),
-                                                    (9, 13, egui::Color32::WHITE),
-                                                    (13, 17, egui::Color32::WHITE),
-                                                ];
-                                                
-                                                // Draw bones (connections)
-                                                for &(from, to, color) in connections {
-                                                    if from < landmarks.len() && to < landmarks.len() {
-                                                        ui.painter().line_segment(
-                                                            [to_screen(from), to_screen(to)],
-                                                            egui::Stroke::new(2.0, color),
-                                                        );
-                                                    }
-                                                }
-                                                
-                                                // Draw joints (landmarks)
-                                                for (idx, &(lx, ly)) in landmarks.iter().enumerate() {
-                                                    let screen_pos = egui::pos2(
+                                            let to_screen = |idx: usize| -> egui::Pos2 {
+                                                if idx < landmarks.len() {
+                                                    let (lx, ly) = landmarks[idx];
+                                                    egui::pos2(
                                                         rect.min.x + lx * scale_x,
                                                         rect.min.y + ly * scale_y,
-                                                    );
-                                                    
-                                                    // Different colors for different landmark types
-                                                    let (radius, color) = match idx {
-                                                        0 => (5.0, egui::Color32::YELLOW),  // Wrist
-                                                        4 | 8 | 12 | 16 | 20 => (4.0, egui::Color32::RED),  // Fingertips
-                                                        _ => (3.0, egui::Color32::WHITE),  // Other joints
-                                                    };
-                                                    
-                                                    ui.painter().circle_filled(screen_pos, radius, color);
+                                                    )
+                                                } else {
+                                                    egui::pos2(0.0, 0.0)
                                                 }
+                                            };
+                                            
+                                            // Hand skeleton connections (MediaPipe format)
+                                            let connections: &[(usize, usize, egui::Color32)] = &[
+                                                // Thumb (orange)
+                                                (0, 1, egui::Color32::from_rgb(255, 165, 0)),
+                                                (1, 2, egui::Color32::from_rgb(255, 165, 0)),
+                                                (2, 3, egui::Color32::from_rgb(255, 165, 0)),
+                                                (3, 4, egui::Color32::from_rgb(255, 165, 0)),
+                                                // Index (green)
+                                                (0, 5, egui::Color32::GREEN),
+                                                (5, 6, egui::Color32::GREEN),
+                                                (6, 7, egui::Color32::GREEN),
+                                                (7, 8, egui::Color32::GREEN),
+                                                // Middle (cyan)
+                                                (0, 9, egui::Color32::LIGHT_BLUE),
+                                                (9, 10, egui::Color32::LIGHT_BLUE),
+                                                (10, 11, egui::Color32::LIGHT_BLUE),
+                                                (11, 12, egui::Color32::LIGHT_BLUE),
+                                                // Ring (magenta)
+                                                (0, 13, egui::Color32::from_rgb(255, 0, 255)),
+                                                (13, 14, egui::Color32::from_rgb(255, 0, 255)),
+                                                (14, 15, egui::Color32::from_rgb(255, 0, 255)),
+                                                (15, 16, egui::Color32::from_rgb(255, 0, 255)),
+                                                // Pinky (red)
+                                                (0, 17, egui::Color32::RED),
+                                                (17, 18, egui::Color32::RED),
+                                                (18, 19, egui::Color32::RED),
+                                                (19, 20, egui::Color32::RED),
+                                                // Palm connections (white)
+                                                (5, 9, egui::Color32::WHITE),
+                                                (9, 13, egui::Color32::WHITE),
+                                                (13, 17, egui::Color32::WHITE),
+                                            ];
+                                            
+                                            // Draw bones
+                                            for &(from, to, color) in connections {
+                                                if from < landmarks.len() && to < landmarks.len() {
+                                                    ui.painter().line_segment(
+                                                        [to_screen(from), to_screen(to)],
+                                                        egui::Stroke::new(2.0, color),
+                                                    );
+                                                }
+                                            }
+                                            
+                                            // Draw joints
+                                            for (idx, &(lx, ly)) in landmarks.iter().enumerate() {
+                                                let screen_pos = egui::pos2(
+                                                    rect.min.x + lx * scale_x,
+                                                    rect.min.y + ly * scale_y,
+                                                );
                                                 
-                                                // Highlight index finger tip with large crosshair
-                                                if landmarks.len() > 8 {
-                                                    let tip_pos = to_screen(8);
-                                                    // Large green circle
-                                                    ui.painter().circle_stroke(
-                                                        tip_pos,
-                                                        15.0,
-                                                        egui::Stroke::new(3.0, egui::Color32::GREEN),
-                                                    );
-                                                    // Crosshair lines
-                                                    ui.painter().line_segment(
-                                                        [egui::pos2(tip_pos.x - 20.0, tip_pos.y), egui::pos2(tip_pos.x + 20.0, tip_pos.y)],
-                                                        egui::Stroke::new(2.0, egui::Color32::GREEN),
-                                                    );
-                                                    ui.painter().line_segment(
-                                                        [egui::pos2(tip_pos.x, tip_pos.y - 20.0), egui::pos2(tip_pos.x, tip_pos.y + 20.0)],
-                                                        egui::Stroke::new(2.0, egui::Color32::GREEN),
-                                                    );
-                                                    
-                                                    // Also draw wrist with big yellow marker
-                                                    let wrist_pos = to_screen(0);
-                                                    ui.painter().circle_filled(wrist_pos, 8.0, egui::Color32::YELLOW);
-                                                }
-                                            } else if let Some((fx, fy)) = finger_tip {
-                                                // Fallback: just draw fingertip if no full landmarks
-                                                let roi_offset = {
-                                                    let state_lock = state.lock().unwrap();
-                                                    state_lock.camera_roi.map(|r| (r.x as f32, r.y as f32)).unwrap_or((0.0, 0.0))
+                                                let (radius, color) = match idx {
+                                                    0 => (5.0, egui::Color32::YELLOW),
+                                                    4 | 8 | 12 | 16 | 20 => (4.0, egui::Color32::RED),
+                                                    _ => (3.0, egui::Color32::WHITE),
                                                 };
-                                                let local_x = fx - roi_offset.0;
-                                                let local_y = fy - roi_offset.1;
                                                 
-                                                let scale_x = display_width / skin_width as f32;
-                                                let scale_y = skin_display_height / skin_height as f32;
-                                                let screen_x = rect.min.x + local_x * scale_x;
-                                                let screen_y = rect.min.y + local_y * scale_y;
-                                                
+                                                ui.painter().circle_filled(screen_pos, radius, color);
+                                            }
+                                            
+                                            // Highlight index finger tip
+                                            if landmarks.len() > 8 {
+                                                let tip_pos = to_screen(8);
                                                 ui.painter().circle_stroke(
-                                                    egui::pos2(screen_x, screen_y),
-                                                    8.0,
+                                                    tip_pos,
+                                                    15.0,
+                                                    egui::Stroke::new(3.0, egui::Color32::GREEN),
+                                                );
+                                                ui.painter().line_segment(
+                                                    [egui::pos2(tip_pos.x - 20.0, tip_pos.y), egui::pos2(tip_pos.x + 20.0, tip_pos.y)],
                                                     egui::Stroke::new(2.0, egui::Color32::GREEN),
                                                 );
+                                                ui.painter().line_segment(
+                                                    [egui::pos2(tip_pos.x, tip_pos.y - 20.0), egui::pos2(tip_pos.x, tip_pos.y + 20.0)],
+                                                    egui::Stroke::new(2.0, egui::Color32::GREEN),
+                                                );
+                                                
+                                                let wrist_pos = to_screen(0);
+                                                ui.painter().circle_filled(wrist_pos, 8.0, egui::Color32::YELLOW);
                                             }
-                                        } else {
-                                            ui.colored_label(egui::Color32::GRAY, 
-                                                format!("Size mismatch: {} vs {}", data.len(), skin_expected_size));
+                                        } else if let Some((fx, fy)) = finger_tip {
+                                            // Fallback: just draw fingertip
+                                            let roi_offset = {
+                                                let state_lock = state.lock().unwrap();
+                                                state_lock.camera_roi.map(|r| (r.x as f32, r.y as f32)).unwrap_or((0.0, 0.0))
+                                            };
+                                            let local_x = fx - roi_offset.0;
+                                            let local_y = fy - roi_offset.1;
+                                            
+                                            let scale_x = hand_display_width / hand_width as f32;
+                                            let scale_y = hand_display_height / hand_height as f32;
+                                            let screen_x = rect.min.x + local_x * scale_x;
+                                            let screen_y = rect.min.y + local_y * scale_y;
+                                            
+                                            ui.painter().circle_stroke(
+                                                egui::pos2(screen_x, screen_y),
+                                                8.0,
+                                                egui::Stroke::new(2.0, egui::Color32::GREEN),
+                                            );
                                         }
                                     } else {
-                                        ui.colored_label(egui::Color32::GRAY, "No data");
+                                        ui.colored_label(egui::Color32::GRAY, 
+                                            format!("Size mismatch: {} vs {}", data.len(), hand_expected_size));
                                     }
-                                });
+                                } else {
+                                    ui.colored_label(egui::Color32::GRAY, "No hand tracking data");
+                                }
                             });
 
                             ui.separator();
@@ -2557,6 +2288,7 @@ impl eframe::App for IntImDnDApp {
             self.drop_confirm_ms = *drop_confirm_ms.lock().unwrap();
             self.hover_show_info_ms = *hover_show_info_ms.lock().unwrap();
             self.hover_info_display_ms = *hover_info_display_ms.lock().unwrap();
+            self.show_calibration_window = *show_calibration_window.lock().unwrap();
             
             // Save settings if any changed
             if old_radius != self.circle_radius
@@ -2587,6 +2319,270 @@ impl eframe::App for IntImDnDApp {
                 if let Some(path) = selected_image_path.lock().unwrap().take() {
                     self.load_image_as_background(&path);
                 }
+            }
+        }
+
+        // Calibration window as a separate OS-level viewport
+        if self.show_calibration_window {
+            let state = self.state.clone();
+            let homography_edit = Arc::new(Mutex::new(self.homography_edit));
+            let show_calibration = Arc::new(Mutex::new(true));
+            let apply_homography = Arc::new(Mutex::new(false));
+            let reset_homography = Arc::new(Mutex::new(false));
+            
+            let homography_edit_c = homography_edit.clone();
+            let show_calibration_c = show_calibration.clone();
+            let apply_homography_c = apply_homography.clone();
+            let reset_homography_c = reset_homography.clone();
+            
+            ctx.show_viewport_immediate(
+                calibration_viewport_id(),
+                egui::ViewportBuilder::default()
+                    .with_title("IntIm-DnD - Calibration Settings")
+                    .with_inner_size([450.0, 600.0]),
+                |ctx, _class| {
+                    // Handle window close request
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        *show_calibration_c.lock().unwrap() = false;
+                    }
+
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.heading("🔧 Calibration Settings");
+                            ui.separator();
+                            
+                            // Homography Matrix Editor
+                            ui.heading("Homography Matrix");
+                            ui.small("Camera-to-projector coordinate transformation");
+                            ui.add_space(4.0);
+                            
+                            {
+                                let mut h = homography_edit_c.lock().unwrap();
+                                egui::Grid::new("homography_grid")
+                                    .num_columns(3)
+                                    .spacing([8.0, 4.0])
+                                    .show(ui, |ui| {
+                                        for row in 0..3 {
+                                            for col in 0..3 {
+                                                ui.add(
+                                                    egui::DragValue::new(&mut h[row][col])
+                                                        .speed(0.01)
+                                                        .fixed_decimals(4)
+                                                );
+                                            }
+                                            ui.end_row();
+                                        }
+                                    });
+                            }
+                            
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Apply Matrix").clicked() {
+                                    *apply_homography_c.lock().unwrap() = true;
+                                }
+                                
+                                if ui.button("Reset to Default").clicked() {
+                                    *reset_homography_c.lock().unwrap() = true;
+                                }
+                            });
+                            
+                            ui.separator();
+                            
+                            // Camera Feed Debug View
+                            ui.heading("Camera Feed");
+                            let (frame_data, frame_w, frame_h) = {
+                                let state_lock = state.lock().unwrap();
+                                (
+                                    state_lock.frame.clone(),
+                                    state_lock.frame_width,
+                                    state_lock.frame_height,
+                                )
+                            };
+                            
+                            let cam_width = frame_w as usize;
+                            let cam_height = frame_h as usize;
+                            let cam_expected_size = cam_width * cam_height * 3;
+                            let cam_aspect = cam_height as f32 / cam_width as f32;
+                            let cam_display_width = 400.0;
+                            let cam_display_height = cam_display_width * cam_aspect;
+                            
+                            if let Some(data) = &frame_data {
+                                if data.len() >= cam_expected_size {
+                                    let image = egui::ColorImage::from_rgb(
+                                        [cam_width, cam_height],
+                                        &data[..cam_expected_size],
+                                    );
+                                    
+                                    let texture: egui::TextureHandle = ctx.load_texture(
+                                        "debug_camera_calib",
+                                        image,
+                                        egui::TextureOptions::LINEAR,
+                                    );
+                                    
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(cam_display_width, cam_display_height),
+                                        egui::Sense::hover(),
+                                    );
+                                    
+                                    ui.painter().image(
+                                        texture.id(),
+                                        rect,
+                                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                        egui::Color32::WHITE,
+                                    );
+                                } else {
+                                    ui.colored_label(egui::Color32::GRAY, "Size mismatch");
+                                }
+                            } else {
+                                ui.colored_label(egui::Color32::GRAY, "No camera data");
+                            }
+                            
+                            ui.separator();
+                            
+                            // Cropped Region Preview
+                            ui.heading("Cropped Region (Hand Tracking)");
+                            let (crop_data, crop_w, crop_h, finger_tip, hand_landmarks) = {
+                                let state_lock = state.lock().unwrap();
+                                (
+                                    state_lock.debug_hand_tracking_frame.clone(),
+                                    state_lock.debug_hand_tracking_width,
+                                    state_lock.debug_hand_tracking_height,
+                                    state_lock.finger_tip_camera,
+                                    state_lock.hand_landmarks.clone(),
+                                )
+                            };
+                            
+                            let crop_width = crop_w as usize;
+                            let crop_height = crop_h as usize;
+                            let crop_expected_size = crop_width * crop_height * 3;
+                            let crop_aspect = crop_height as f32 / crop_width as f32;
+                            let crop_display_width = 400.0;
+                            let crop_display_height = crop_display_width * crop_aspect;
+                            
+                            if let Some(data) = &crop_data {
+                                if data.len() >= crop_expected_size {
+                                    let image = egui::ColorImage::from_rgb(
+                                        [crop_width, crop_height],
+                                        &data[..crop_expected_size],
+                                    );
+                                    
+                                    let texture: egui::TextureHandle = ctx.load_texture(
+                                        "debug_crop_calib",
+                                        image,
+                                        egui::TextureOptions::LINEAR,
+                                    );
+                                    
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(crop_display_width, crop_display_height),
+                                        egui::Sense::hover(),
+                                    );
+                                    
+                                    ui.painter().image(
+                                        texture.id(),
+                                        rect,
+                                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                        egui::Color32::WHITE,
+                                    );
+                                    
+                                    // Draw hand skeleton overlay if available
+                                    if let Some(landmarks) = &hand_landmarks {
+                                        let scale_x = crop_display_width / crop_width as f32;
+                                        let scale_y = crop_display_height / crop_height as f32;
+                                        
+                                        let to_screen = |idx: usize| -> egui::Pos2 {
+                                            if idx < landmarks.len() {
+                                                let (lx, ly) = landmarks[idx];
+                                                egui::pos2(
+                                                    rect.min.x + lx * scale_x,
+                                                    rect.min.y + ly * scale_y,
+                                                )
+                                            } else {
+                                                egui::pos2(0.0, 0.0)
+                                            }
+                                        };
+                                        
+                                        // Draw joints
+                                        for (idx, &(lx, ly)) in landmarks.iter().enumerate() {
+                                            let screen_pos = egui::pos2(
+                                                rect.min.x + lx * scale_x,
+                                                rect.min.y + ly * scale_y,
+                                            );
+                                            
+                                            let (radius, color) = match idx {
+                                                0 => (5.0, egui::Color32::YELLOW),
+                                                4 | 8 | 12 | 16 | 20 => (4.0, egui::Color32::RED),
+                                                _ => (3.0, egui::Color32::WHITE),
+                                            };
+                                            
+                                            ui.painter().circle_filled(screen_pos, radius, color);
+                                        }
+                                        
+                                        // Highlight fingertip
+                                        if landmarks.len() > 8 {
+                                            let tip_pos = to_screen(8);
+                                            ui.painter().circle_stroke(
+                                                tip_pos,
+                                                12.0,
+                                                egui::Stroke::new(2.0, egui::Color32::GREEN),
+                                            );
+                                        }
+                                    } else if let Some((fx, fy)) = finger_tip {
+                                        // Fallback: draw fingertip point
+                                        let roi_offset = {
+                                            let state_lock = state.lock().unwrap();
+                                            state_lock.camera_roi.map(|r| (r.x as f32, r.y as f32)).unwrap_or((0.0, 0.0))
+                                        };
+                                        let local_x = fx - roi_offset.0;
+                                        let local_y = fy - roi_offset.1;
+                                        
+                                        let scale_x = crop_display_width / crop_width as f32;
+                                        let scale_y = crop_display_height / crop_height as f32;
+                                        let screen_x = rect.min.x + local_x * scale_x;
+                                        let screen_y = rect.min.y + local_y * scale_y;
+                                        
+                                        ui.painter().circle_stroke(
+                                            egui::pos2(screen_x, screen_y),
+                                            8.0,
+                                            egui::Stroke::new(2.0, egui::Color32::GREEN),
+                                        );
+                                    }
+                                } else {
+                                    ui.colored_label(egui::Color32::GRAY, "Size mismatch");
+                                }
+                            } else {
+                                ui.colored_label(egui::Color32::GRAY, "No cropped region data");
+                            }
+                            
+                            ui.add_space(16.0);
+                            
+                            if ui.button("Close").clicked() {
+                                *show_calibration_c.lock().unwrap() = false;
+                            }
+                        });
+                    });
+                },
+            );
+            
+            // Update from Arc values
+            self.homography_edit = *homography_edit.lock().unwrap();
+            self.show_calibration_window = *show_calibration.lock().unwrap();
+            
+            // Handle apply/reset actions
+            if *apply_homography.lock().unwrap() {
+                let h = self.homography_edit;
+                self.state.lock().unwrap().set_homography(h);
+                // Convert to Matrix3 for saving
+                let matrix = Matrix3::from_row_slice(&h.concat());
+                let _ = save_homography(&matrix);
+                log::info!("Applied and saved homography matrix");
+            }
+            
+            if *reset_homography.lock().unwrap() {
+                self.homography_edit = HOMOGRAPHY;
+                self.state.lock().unwrap().set_homography(HOMOGRAPHY);
+                let matrix = Matrix3::from_row_slice(&HOMOGRAPHY.concat());
+                let _ = save_homography(&matrix);
+                log::info!("Reset homography to default");
             }
         }
 
