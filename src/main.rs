@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 fn load_gemini_api_token() -> Option<String> {
     let paths = [
         PathBuf::from("gemini_api_token.txt"),
-        dirs::config_dir().map(|d| d.join("finger_tracker/gemini_api_token.txt")).unwrap_or_default(),
+        dirs::config_dir().map(|d| d.join("intim-dnd/gemini_api_token.txt")).unwrap_or_default(),
         dirs::home_dir().map(|d| d.join(".gemini_api_token")).unwrap_or_default(),
     ];
     
@@ -202,9 +202,11 @@ struct Character {
 
 impl Character {
     fn new(config: CharacterConfig) -> Self {
-        // Try to load token image
-        let token_path = format!("assets/token_reps/{}", config.token_representation);
-        let token_image = Self::load_token_image(&token_path);
+        // Try to load token image from config folder
+        let token_path = dirs::config_dir()
+            .map(|d| d.join(format!("intim-dnd/token_reps/{}", config.token_representation)))
+            .unwrap_or_else(|| PathBuf::from(format!("token_reps/{}", config.token_representation)));
+        let token_image = Self::load_token_image(token_path.to_str().unwrap_or(""));
         
         Self {
             config,
@@ -248,7 +250,9 @@ impl Character {
 
 /// Load characters from YAML config file
 fn load_characters() -> Vec<Character> {
-    let config_path = PathBuf::from("../config/characters.yaml");
+    let config_path = dirs::config_dir()
+        .map(|d| d.join("intim-dnd/characters.yaml"))
+        .unwrap_or_else(|| PathBuf::from("characters.yaml"));
     
     let content = match fs::read_to_string(&config_path) {
         Ok(c) => c,
@@ -372,7 +376,7 @@ struct CameraRoi {
 fn get_homography_file_path() -> PathBuf {
     // Store in user's config directory or current directory
     if let Some(config_dir) = dirs::config_dir() {
-        let app_dir = config_dir.join("finger_tracker");
+        let app_dir = config_dir.join("intim-dnd");
         let _ = fs::create_dir_all(&app_dir);
         app_dir.join("homography.txt")
     } else {
@@ -383,7 +387,7 @@ fn get_homography_file_path() -> PathBuf {
 /// Get the path to the camera ROI calibration file
 fn get_roi_file_path() -> PathBuf {
     if let Some(config_dir) = dirs::config_dir() {
-        let app_dir = config_dir.join("finger_tracker");
+        let app_dir = config_dir.join("intim-dnd");
         let _ = fs::create_dir_all(&app_dir);
         app_dir.join("camera_roi.txt")
     } else {
@@ -1134,7 +1138,7 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
 }
 
 /// Main application struct for egui
-struct FingerTrackerApp {
+struct IntImDnDApp {
     state: Arc<Mutex<SharedState>>,
     texture: Option<egui::TextureHandle>,
     /// Background image for projector output
@@ -1186,7 +1190,7 @@ struct FingerTrackerApp {
     drop_confirm_ms: u64,
 }
 
-impl FingerTrackerApp {
+impl IntImDnDApp {
     fn new(state: Arc<Mutex<SharedState>>) -> Self {
         // Get the homography from state (may have been loaded from file)
         let homography_edit = {
@@ -1285,9 +1289,11 @@ impl FingerTrackerApp {
         self.background_texture = None;
     }
     
-    /// Load existing generated images from the assets/generated folder
+    /// Load existing generated images from the config generated folder
     fn load_existing_generated_images() -> Vec<GeneratedImage> {
-        let generated_dir = PathBuf::from("assets/generated");
+        let generated_dir = dirs::config_dir()
+            .map(|d| d.join("intim-dnd/generated"))
+            .unwrap_or_else(|| PathBuf::from("generated"));
         let mut images = Vec::new();
         
         if generated_dir.exists() {
@@ -1432,7 +1438,7 @@ fn options_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("options_viewport")
 }
 
-impl eframe::App for FingerTrackerApp {
+impl eframe::App for IntImDnDApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Request continuous repaint for real-time updates
         ctx.request_repaint();
@@ -1506,7 +1512,7 @@ impl eframe::App for FingerTrackerApp {
             ctx.show_viewport_immediate(
                 options_viewport_id(),
                 egui::ViewportBuilder::default()
-                    .with_title("Finger Tracker - Options")
+                    .with_title("IntIm-DnD - Options")
                     .with_inner_size([350.0, 650.0]),
                 |ctx, _class| {
                     // Handle window close request
@@ -1516,7 +1522,7 @@ impl eframe::App for FingerTrackerApp {
 
                     egui::CentralPanel::default().show(ctx, |ui| {
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            ui.heading("Finger Tracker Options");
+                            ui.heading("IntIm-DnD Options");
                             ui.separator();
 
                             {
@@ -1558,7 +1564,7 @@ impl eframe::App for FingerTrackerApp {
                                 let mut chars = characters_c.lock().unwrap();
                                 if chars.is_empty() {
                                     ui.colored_label(egui::Color32::GRAY, "No characters loaded");
-                                    ui.small("Add characters to config/characters.yaml");
+                                    ui.small("Add characters to ~/.config/intim-dnd/characters.yaml");
                                 } else {
                                     for char in chars.iter_mut() {
                                         ui.horizontal(|ui| {
@@ -1646,7 +1652,7 @@ impl eframe::App for FingerTrackerApp {
                                     ui.label("✓ Hand landmark model loaded");
                                 } else {
                                     ui.colored_label(egui::Color32::RED, "✗ Model not found");
-                                    ui.small("Place hand_landmark.onnx in models/ folder");
+                                    ui.small("Place hand_landmarker.task in ~/.config/intim-dnd/models/");
                                 }
                             }
 
@@ -2155,8 +2161,10 @@ impl eframe::App for FingerTrackerApp {
                                             thread::spawn(move || {
                                                 match generate_image_with_gemini(&token, &prompt_for_thread) {
                                                     Ok(image_bytes) => {
-                                                        // Create generated folder if it doesn't exist
-                                                        let generated_dir = PathBuf::from("assets/generated");
+                                                        // Create generated folder in config if it doesn't exist
+                                                        let generated_dir = dirs::config_dir()
+                                                            .map(|d| d.join("intim-dnd/generated"))
+                                                            .unwrap_or_else(|| std::path::PathBuf::from("generated"));
                                                         if let Err(e) = fs::create_dir_all(&generated_dir) {
                                                             *status_clone.lock().unwrap() = ImageGenStatus::Error(format!("Failed to create folder: {}", e));
                                                             return;
@@ -2172,7 +2180,7 @@ impl eframe::App for FingerTrackerApp {
                                                                 
                                                                 // Add to gallery
                                                                 let mut images = images_clone.lock().unwrap();
-                                                                FingerTrackerApp::add_generated_image(
+                                                                IntImDnDApp::add_generated_image(
                                                                     &mut images,
                                                                     save_path.clone(),
                                                                     prompt_for_thread.clone()
@@ -3142,7 +3150,7 @@ fn main() -> Result<()> {
     // Camera device path - change this if your camera is at a different device
     let device_path = "/dev/video5";
 
-    log::info!("Starting Finger Tracker");
+    log::info!("Starting IntIm-DnD application");
     log::info!("Camera device: {}", device_path);
 
     // Create shared state
@@ -3167,7 +3175,7 @@ fn main() -> Result<()> {
     eframe::run_native(
         "Finger Tracker",
         options,
-        Box::new(|_cc| Ok(Box::new(FingerTrackerApp::new(state)))),
+        Box::new(|_cc| Ok(Box::new(IntImDnDApp::new(state)))),
     )
     .map_err(|e| anyhow::anyhow!("Failed to run application: {}", e))?;
 

@@ -3,6 +3,27 @@
 version = 4
 
 [[package]]
+name = "IntIm-DnD"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "dirs",
+ "eframe",
+ "egui",
+ "egui_extras",
+ "env_logger",
+ "image",
+ "log",
+ "nalgebra",
+ "opencv",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "ureq",
+]
+
+[[package]]
 name = "ab_glyph"
 version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1472,27 +1493,6 @@ name = "find-msvc-tools"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a3076410a55c90011c298b04d0cfa770b00fa04e1e3c97d3f6c9de105a03844"
-
-[[package]]
-name = "finger_tracker"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "dirs",
- "eframe",
- "egui",
- "egui_extras",
- "env_logger",
- "image",
- "log",
- "nalgebra",
- "opencv",
- "serde",
- "serde_json",
- "serde_yaml",
- "ureq",
-]
 
 [[package]]
 name = "flate2"

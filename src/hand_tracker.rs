@@ -7,7 +7,7 @@
 //!
 //! Download the MediaPipe hand landmarker model:
 //! wget https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
-//! Place it at: models/hand_landmarker.task
+//! Place it at: ~/.config/intim-dnd/models/hand_landmarker.task
 
 use anyhow::{Context, Result};
 use opencv::{
@@ -315,9 +315,11 @@ impl Drop for HandTracker {
     }
 }
 
-/// Get the default model path relative to the executable
+/// Get the default model path from config directory
 pub fn default_model_path() -> std::path::PathBuf {
-    std::path::PathBuf::from("models/hand_landmarker.task")
+    dirs::config_dir()
+        .map(|d| d.join("intim-dnd/models/hand_landmarker.task"))
+        .unwrap_or_else(|| std::path::PathBuf::from("models/hand_landmarker.task"))
 }
 
 /// Check if a hand landmark model is available

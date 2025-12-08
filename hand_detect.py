@@ -7,14 +7,30 @@ Reads images from stdin (as raw bytes), outputs JSON landmarks to stdout.
 import sys
 import json
 import struct
+import os
 import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
+def get_model_path():
+    """Get the model path from config directory or fallback to local."""
+    # Try config directory first
+    config_dir = os.path.expanduser("~/.config/intim-dnd/models")
+    config_path = os.path.join(config_dir, "hand_landmarker.task")
+    if os.path.exists(config_path):
+        return config_path
+    # Fallback to local models directory
+    local_path = "models/hand_landmarker.task"
+    if os.path.exists(local_path):
+        return local_path
+    # Return config path (will error with helpful message)
+    return config_path
+
 def main():
     # Initialize the hand landmarker
-    base_options = python.BaseOptions(model_asset_path='models/hand_landmarker.task')
+    model_path = get_model_path()
+    base_options = python.BaseOptions(model_asset_path=model_path)
     options = vision.HandLandmarkerOptions(
         base_options=base_options,
         num_hands=2,
