@@ -2864,10 +2864,32 @@ impl eframe::App for IntImDnDApp {
                                 }
                             }
                         }
-                        DragState::Dragging { character_index, original_pos, .. } => {
+                        DragState::Dragging { character_index, original_pos, current_pos } => {
                             if !pinch_active {
-                                // Dropped without confirming - return to original position
-                                log::info!("Drag cancelled, returning character to original position");
+                                // Dropped - place character at last pinch position
+                                let screen_pos = (
+                                    rect.min.x + current_pos.0 * (available_size.x / self.projector_width),
+                                    rect.min.y + current_pos.1 * (available_size.y / self.projector_height),
+                                );
+                                
+                                // Find the cell at the drop position
+                                if let Some(target_cell) = self.projector_to_grid_cell(screen_pos.0, screen_pos.1, &rect) {
+                                    // Check if cell is not occupied by another character
+                                    let cell_occupied = self.find_character_at_cell(target_cell)
+                                        .map(|idx| idx != character_index)
+                                        .unwrap_or(false);
+                                    
+                                    if !cell_occupied {
+                                        // Place character at new cell
+                                        {
+                                            let mut chars = self.characters.lock().unwrap();
+                                            chars[character_index].grid_pos = target_cell;
+                                        }
+                                        log::info!("Dropped character {} at {:?}", character_index, target_cell);
+                                    } else {
+                                        log::info!("Drop location occupied, character stays at original position");
+                                    }
+                                }
                                 self.last_pinch_detected = None;
                                 self.last_pinch_position = None;
                                 Some(DragState::Idle)
@@ -2916,8 +2938,12 @@ impl eframe::App for IntImDnDApp {
                         }
                         DragState::DroppingOff { start_time, character_index, original_pos, target_cell, position } => {
                             if !pinch_active {
-                                // Dropped without confirming - return to original position
-                                log::info!("Drop cancelled, returning character to original position");
+                                // Dropped - place character at target cell (even without full confirmation)
+                                {
+                                    let mut chars = self.characters.lock().unwrap();
+                                    chars[character_index].grid_pos = target_cell;
+                                }
+                                log::info!("Dropped character {} at {:?} (quick drop)", character_index, target_cell);
                                 self.last_pinch_detected = None;
                                 self.last_pinch_position = None;
                                 Some(DragState::Idle)
