@@ -119,6 +119,10 @@ const DEFAULT_PINCH_PICKUP_MS: u64 = 1000;          // Additional time to comple
 const DEFAULT_PINCH_FLICKER_TOLERANCE_MS: u64 = 200; // Tolerance for tracking flicker
 const DEFAULT_DROP_CONFIRM_MS: u64 = 500;           // Time to confirm drop
 
+/// Default hover timing values (in milliseconds)
+const DEFAULT_HOVER_SHOW_INFO_MS: u64 = 500;        // Time finger must hover to show info panel
+const DEFAULT_HOVER_INFO_DISPLAY_MS: u64 = 5000;    // How long to display the info panel
+
 /// Persistent application settings
 #[derive(Serialize, Deserialize, Clone)]
 struct AppSettings {
@@ -142,6 +146,10 @@ struct AppSettings {
     pinch_flicker_tolerance_ms: u64,
     /// Drag timing: time to confirm drop (ms)
     drop_confirm_ms: u64,
+    /// Hover timing: time finger must hover to show info panel (ms)
+    hover_show_info_ms: u64,
+    /// Hover timing: how long to display the info panel (ms)
+    hover_info_display_ms: u64,
     /// Path to the current background image (if any)
     background_image_path: Option<String>,
 }
@@ -159,6 +167,8 @@ impl Default for AppSettings {
             pinch_pickup_ms: DEFAULT_PINCH_PICKUP_MS,
             pinch_flicker_tolerance_ms: DEFAULT_PINCH_FLICKER_TOLERANCE_MS,
             drop_confirm_ms: DEFAULT_DROP_CONFIRM_MS,
+            hover_show_info_ms: DEFAULT_HOVER_SHOW_INFO_MS,
+            hover_info_display_ms: DEFAULT_HOVER_INFO_DISPLAY_MS,
             background_image_path: None,
         }
     }
@@ -1288,6 +1298,14 @@ struct IntImDnDApp {
     drop_confirm_ms: u64,
     /// Current background image path (for saving to settings)
     current_background_path: Option<String>,
+    /// Hover timing: time finger must hover to show info panel (ms)
+    hover_show_info_ms: u64,
+    /// Hover timing: how long to display the info panel (ms)
+    hover_info_display_ms: u64,
+    /// Hover state: character being hovered and when hover started
+    hover_state: Option<(usize, Instant)>,
+    /// Info panel state: character to show info for and when to hide
+    info_panel_state: Option<(usize, Instant)>,
 }
 
 impl IntImDnDApp {
@@ -1361,6 +1379,10 @@ impl IntImDnDApp {
             pinch_flicker_tolerance_ms: settings.pinch_flicker_tolerance_ms,
             drop_confirm_ms: settings.drop_confirm_ms,
             current_background_path: settings.background_image_path,
+            hover_show_info_ms: settings.hover_show_info_ms,
+            hover_info_display_ms: settings.hover_info_display_ms,
+            hover_state: None,
+            info_panel_state: None,
         }
     }
     
@@ -1378,6 +1400,8 @@ impl IntImDnDApp {
             pinch_pickup_ms: self.pinch_pickup_ms,
             pinch_flicker_tolerance_ms: self.pinch_flicker_tolerance_ms,
             drop_confirm_ms: self.drop_confirm_ms,
+            hover_show_info_ms: self.hover_show_info_ms,
+            hover_info_display_ms: self.hover_info_display_ms,
             background_image_path: self.current_background_path.clone(),
         };
         save_settings(&settings);
@@ -1623,6 +1647,8 @@ impl eframe::App for IntImDnDApp {
             let pinch_pickup_ms = Arc::new(Mutex::new(self.pinch_pickup_ms));
             let pinch_flicker_tolerance_ms = Arc::new(Mutex::new(self.pinch_flicker_tolerance_ms));
             let drop_confirm_ms = Arc::new(Mutex::new(self.drop_confirm_ms));
+            let hover_show_info_ms = Arc::new(Mutex::new(self.hover_show_info_ms));
+            let hover_info_display_ms = Arc::new(Mutex::new(self.hover_info_display_ms));
 
             // Clone Arcs for the closure
             let show_camera_feed_c = show_camera_feed.clone();
@@ -1646,6 +1672,8 @@ impl eframe::App for IntImDnDApp {
             let pinch_pickup_ms_c = pinch_pickup_ms.clone();
             let pinch_flicker_tolerance_ms_c = pinch_flicker_tolerance_ms.clone();
             let drop_confirm_ms_c = drop_confirm_ms.clone();
+            let hover_show_info_ms_c = hover_show_info_ms.clone();
+            let hover_info_display_ms_c = hover_info_display_ms.clone();
 
             ctx.show_viewport_immediate(
                 options_viewport_id(),
@@ -1769,6 +1797,18 @@ impl eframe::App for IntImDnDApp {
                             {
                                 let mut val = drop_confirm_ms_c.lock().unwrap();
                                 ui.add(egui::Slider::new(&mut *val, 100..=2000).text("Drop confirm (ms)"));
+                            }
+
+                            ui.separator();
+                            ui.heading("👁️ Character Info Panel");
+                            ui.small("Hover finger over character to show info");
+                            {
+                                let mut val = hover_show_info_ms_c.lock().unwrap();
+                                ui.add(egui::Slider::new(&mut *val, 100..=2000).text("Hover delay (ms)"));
+                            }
+                            {
+                                let mut val = hover_info_display_ms_c.lock().unwrap();
+                                ui.add(egui::Slider::new(&mut *val, 1000..=10000).text("Display duration (ms)"));
                             }
 
                             ui.separator();
@@ -2498,6 +2538,8 @@ impl eframe::App for IntImDnDApp {
             let old_pinch_pickup = self.pinch_pickup_ms;
             let old_flicker_tolerance = self.pinch_flicker_tolerance_ms;
             let old_drop_confirm = self.drop_confirm_ms;
+            let old_hover_show_info = self.hover_show_info_ms;
+            let old_hover_info_display = self.hover_info_display_ms;
             
             self.show_camera_feed = *show_camera_feed.lock().unwrap();
             self.circle_radius = *circle_radius.lock().unwrap();
@@ -2513,6 +2555,8 @@ impl eframe::App for IntImDnDApp {
             self.pinch_pickup_ms = *pinch_pickup_ms.lock().unwrap();
             self.pinch_flicker_tolerance_ms = *pinch_flicker_tolerance_ms.lock().unwrap();
             self.drop_confirm_ms = *drop_confirm_ms.lock().unwrap();
+            self.hover_show_info_ms = *hover_show_info_ms.lock().unwrap();
+            self.hover_info_display_ms = *hover_info_display_ms.lock().unwrap();
             
             // Save settings if any changed
             if old_radius != self.circle_radius
@@ -2525,6 +2569,8 @@ impl eframe::App for IntImDnDApp {
                 || old_pinch_pickup != self.pinch_pickup_ms
                 || old_flicker_tolerance != self.pinch_flicker_tolerance_ms
                 || old_drop_confirm != self.drop_confirm_ms
+                || old_hover_show_info != self.hover_show_info_ms
+                || old_hover_info_display != self.hover_info_display_ms
             {
                 self.save_current_settings();
             }
@@ -3095,6 +3141,196 @@ impl eframe::App for IntImDnDApp {
                                 &char.config.name.chars().next().unwrap_or('?').to_string(),
                                 egui::FontId::proportional(token_size * 0.5),
                                 egui::Color32::WHITE,
+                            );
+                        }
+                    }
+                }
+                
+                // Handle hover detection for character info panel (only when not pinching/dragging)
+                let now = Instant::now();
+                if !is_pinching && matches!(self.drag_state, DragState::Idle) {
+                    if let Some((px, py)) = finger_projector {
+                        let cell_size = rect.height() / self.grid_rows as f32;
+                        let screen_x = rect.min.x + px * (available_size.x / self.projector_width);
+                        let screen_y = rect.min.y + py * (available_size.y / self.projector_height);
+                        
+                        // Check which character (if any) the finger is over
+                        let hovered_char = if let Some(cell) = self.projector_to_grid_cell(screen_x, screen_y, &rect) {
+                            self.find_character_at_cell(cell)
+                        } else {
+                            None
+                        };
+                        
+                        if let Some(char_idx) = hovered_char {
+                            // Finger is over a character
+                            match self.hover_state {
+                                Some((prev_idx, start_time)) if prev_idx == char_idx => {
+                                    // Still hovering over the same character
+                                    let hover_duration = now.duration_since(start_time).as_millis() as u64;
+                                    if hover_duration >= self.hover_show_info_ms {
+                                        // Trigger info panel display
+                                        if self.info_panel_state.map(|(idx, _)| idx != char_idx).unwrap_or(true) {
+                                            self.info_panel_state = Some((char_idx, now));
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    // Started hovering over a new character
+                                    self.hover_state = Some((char_idx, now));
+                                }
+                            }
+                        } else {
+                            // Not hovering over any character
+                            self.hover_state = None;
+                        }
+                    } else {
+                        // No finger detected
+                        self.hover_state = None;
+                    }
+                } else {
+                    // Pinching or dragging, reset hover state
+                    self.hover_state = None;
+                }
+                
+                // Check if info panel should be hidden
+                if let Some((_, show_time)) = self.info_panel_state {
+                    let display_duration = now.duration_since(show_time).as_millis() as u64;
+                    if display_duration >= self.hover_info_display_ms {
+                        self.info_panel_state = None;
+                    }
+                }
+                
+                // Draw character info panel if active
+                if let Some((char_idx, _)) = self.info_panel_state {
+                    let chars = self.characters.lock().unwrap();
+                    if let Some(char) = chars.get(char_idx) {
+                        let cell_size = rect.height() / self.grid_rows as f32;
+                        
+                        // Position the panel near the character
+                        let cell_x = rect.min.x + char.grid_pos.0 as f32 * cell_size;
+                        let cell_y = rect.min.y + char.grid_pos.1 as f32 * cell_size;
+                        
+                        // Panel dimensions
+                        let panel_width = cell_size * 3.5;
+                        let panel_height = cell_size * 2.8;
+                        let panel_margin = cell_size * 0.2;
+                        
+                        // Position panel to the right of the character, or left if it would go off-screen
+                        let panel_x = if cell_x + cell_size + panel_width + panel_margin < rect.max.x {
+                            cell_x + cell_size + panel_margin
+                        } else {
+                            cell_x - panel_width - panel_margin
+                        };
+                        
+                        // Keep panel vertically centered with character but within bounds
+                        let panel_y = (cell_y + cell_size / 2.0 - panel_height / 2.0)
+                            .max(rect.min.y + panel_margin)
+                            .min(rect.max.y - panel_height - panel_margin);
+                        
+                        let panel_rect = egui::Rect::from_min_size(
+                            egui::pos2(panel_x, panel_y),
+                            egui::vec2(panel_width, panel_height),
+                        );
+                        
+                        // Draw panel background with semi-transparent dark background
+                        ui.painter().rect_filled(
+                            panel_rect,
+                            8.0,
+                            egui::Color32::from_rgba_unmultiplied(20, 20, 30, 230),
+                        );
+                        ui.painter().rect_stroke(
+                            panel_rect,
+                            8.0,
+                            egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 150, 200)),
+                        );
+                        
+                        // Text styling
+                        let padding = cell_size * 0.15;
+                        let line_height = cell_size * 0.28;
+                        let mut y_offset = panel_rect.min.y + padding;
+                        
+                        // Character name (larger, bold)
+                        ui.painter().text(
+                            egui::pos2(panel_rect.min.x + padding, y_offset),
+                            egui::Align2::LEFT_TOP,
+                            &char.config.name,
+                            egui::FontId::proportional(line_height * 1.2),
+                            egui::Color32::from_rgb(255, 220, 100),
+                        );
+                        y_offset += line_height * 1.4;
+                        
+                        // Class
+                        ui.painter().text(
+                            egui::pos2(panel_rect.min.x + padding, y_offset),
+                            egui::Align2::LEFT_TOP,
+                            &format!("Class: {}", char.config.class),
+                            egui::FontId::proportional(line_height * 0.85),
+                            egui::Color32::from_rgb(180, 180, 200),
+                        );
+                        y_offset += line_height;
+                        
+                        // HP with color based on health
+                        let health_pct = char.health_percentage();
+                        let hp_color = if health_pct > 0.5 {
+                            egui::Color32::from_rgb(100, 255, 100)
+                        } else if health_pct > 0.25 {
+                            egui::Color32::from_rgb(255, 255, 100)
+                        } else {
+                            egui::Color32::from_rgb(255, 100, 100)
+                        };
+                        ui.painter().text(
+                            egui::pos2(panel_rect.min.x + padding, y_offset),
+                            egui::Align2::LEFT_TOP,
+                            &format!("HP: {} / {}", char.config.health, char.config.hit_points),
+                            egui::FontId::proportional(line_height * 0.85),
+                            hp_color,
+                        );
+                        y_offset += line_height;
+                        
+                        // Armor Class
+                        ui.painter().text(
+                            egui::pos2(panel_rect.min.x + padding, y_offset),
+                            egui::Align2::LEFT_TOP,
+                            &format!("AC: {}", char.config.armor_class),
+                            egui::FontId::proportional(line_height * 0.85),
+                            egui::Color32::from_rgb(150, 200, 255),
+                        );
+                        y_offset += line_height;
+                        
+                        // Current weapon
+                        ui.painter().text(
+                            egui::pos2(panel_rect.min.x + padding, y_offset),
+                            egui::Align2::LEFT_TOP,
+                            &format!("Weapon: {}", char.config.current_weapon),
+                            egui::FontId::proportional(line_height * 0.85),
+                            egui::Color32::from_rgb(255, 180, 150),
+                        );
+                        y_offset += line_height;
+                        
+                        // Find weapon details
+                        if let Some(weapon) = char.config.weapons.iter().find(|w| w.name == char.config.current_weapon) {
+                            let modifier_str = if weapon.modifier >= 0 {
+                                format!("+{}", weapon.modifier)
+                            } else {
+                                format!("{}", weapon.modifier)
+                            };
+                            ui.painter().text(
+                                egui::pos2(panel_rect.min.x + padding, y_offset),
+                                egui::Align2::LEFT_TOP,
+                                &format!("  {} ({})", weapon.damage, modifier_str),
+                                egui::FontId::proportional(line_height * 0.75),
+                                egui::Color32::from_rgb(200, 150, 130),
+                            );
+                        }
+                        
+                        // Status indicator if dead
+                        if char.config.dead {
+                            ui.painter().text(
+                                egui::pos2(panel_rect.center().x, panel_rect.max.y - padding),
+                                egui::Align2::CENTER_BOTTOM,
+                                "☠️ DEAD",
+                                egui::FontId::proportional(line_height * 0.9),
+                                egui::Color32::from_rgb(255, 50, 50),
                             );
                         }
                     }
