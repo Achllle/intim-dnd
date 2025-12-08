@@ -81,6 +81,44 @@ enum ImageGenStatus {
     Error(String),
 }
 
+/// Character drag-and-drop state
+#[derive(Clone, PartialEq)]
+enum DragState {
+    /// Not dragging anything
+    Idle,
+    /// Pinch detected, waiting for initial 300ms to show loading bar
+    PinchStarted {
+        start_time: Instant,
+        position: (f32, f32), // projector coordinates
+    },
+    /// Loading bar showing (300ms-1300ms), waiting for pickup
+    PickingUp {
+        start_time: Instant,
+        position: (f32, f32),
+        character_index: usize,
+    },
+    /// Character is being dragged
+    Dragging {
+        character_index: usize,
+        original_pos: (u32, u32),
+        current_pos: (f32, f32), // projector coordinates
+    },
+    /// Character is over a cell, waiting for drop confirmation
+    DroppingOff {
+        start_time: Instant,
+        character_index: usize,
+        original_pos: (u32, u32),
+        target_cell: (u32, u32),
+        position: (f32, f32),
+    },
+}
+
+/// Default drag-and-drop timing values (in milliseconds)
+const DEFAULT_PINCH_SHOW_LOADING_MS: u64 = 300;    // Time before showing loading bar
+const DEFAULT_PINCH_PICKUP_MS: u64 = 1000;          // Additional time to complete pickup
+const DEFAULT_PINCH_FLICKER_TOLERANCE_MS: u64 = 200; // Tolerance for tracking flicker
+const DEFAULT_DROP_CONFIRM_MS: u64 = 500;           // Time to confirm drop
+
 /// A generated image entry for the gallery
 #[derive(Clone)]
 struct GeneratedImage {
@@ -330,21 +368,6 @@ struct CameraRoi {
     height: i32,
 }
 
-/// A ripple effect emanating from a pinch location
-#[derive(Clone)]
-struct Ripple {
-    /// Center position in projector coordinates
-    center: (f32, f32),
-    /// Time when the ripple was created
-    start_time: Instant,
-    /// Maximum radius the ripple will expand to
-    max_radius: f32,
-    /// Duration of the ripple animation in seconds
-    duration: f32,
-    /// Color of the ripple
-    color: egui::Color32,
-}
-
 /// Get the path to the homography calibration file
 fn get_homography_file_path() -> PathBuf {
     // Store in user's config directory or current directory
@@ -529,10 +552,6 @@ struct SharedState {
     is_pinching: bool,
     /// Pinch center in camera coordinates (normalized 0-1)
     pinch_center_camera: Option<(f32, f32)>,
-    /// Active ripple effects
-    ripples: Vec<Ripple>,
-    /// Cooldown to prevent multiple ripples from same pinch
-    last_pinch_time: Option<Instant>,
 }
 
 impl Default for CalibrationData {
@@ -633,8 +652,6 @@ impl SharedState {
             hand_landmarks: None,
             is_pinching: false,
             pinch_center_camera: None,
-            ripples: Vec::new(),
-            last_pinch_time: None,
         }
     }
 
@@ -1087,51 +1104,9 @@ fn camera_thread(state: Arc<Mutex<SharedState>>, device_path: &str) {
                     // Update hand landmarks (for ML mode visualization)
                     state.hand_landmarks = hand_landmarks;
                     
-                    // Handle pinch detection and ripple creation
-                    let was_pinching = state.is_pinching;
+                    // Handle pinch detection
                     state.is_pinching = pinch_center.is_some();
                     state.pinch_center_camera = pinch_center;
-                    
-                    // Create a ripple on pinch start (rising edge)
-                    if state.is_pinching && !was_pinching {
-                        // Check cooldown to prevent rapid ripples
-                        let cooldown_ok = state.last_pinch_time
-                            .map(|t| t.elapsed().as_secs_f32() > 0.3)
-                            .unwrap_or(true);
-                        
-                        if cooldown_ok {
-                            if let Some((px, py)) = pinch_center {
-                                // Convert normalized pinch center to full camera coordinates
-                                let camera_roi = state.camera_roi;
-                                let (cam_x, cam_y) = if let Some(roi) = camera_roi {
-                                    // Pinch is in ROI-local normalized coords, convert to full frame
-                                    let full_x = roi.x as f32 + px * roi.width as f32;
-                                    let full_y = roi.y as f32 + py * roi.height as f32;
-                                    (full_x, full_y)
-                                } else {
-                                    // Pinch is in full frame normalized coords
-                                    (px * state.frame_width as f32, py * state.frame_height as f32)
-                                };
-                                
-                                // Transform to projector coordinates
-                                let proj_pos = state.transform_point((cam_x, cam_y));
-                                
-                                log::info!("Pinch detected! Creating ripple at projector ({:.0}, {:.0})", proj_pos.0, proj_pos.1);
-                                
-                                state.ripples.push(Ripple {
-                                    center: proj_pos,
-                                    start_time: Instant::now(),
-                                    max_radius: 300.0,
-                                    duration: 1.5,
-                                    color: egui::Color32::from_rgba_unmultiplied(100, 200, 255, 200),
-                                });
-                                state.last_pinch_time = Some(Instant::now());
-                            }
-                        }
-                    }
-                    
-                    // Clean up expired ripples
-                    state.ripples.retain(|r| r.start_time.elapsed().as_secs_f32() < r.duration);
                     
                     // Only accumulate positions during capture phase
                     if matches!(state.calibration.state, CalibrationState::CapturingDot { .. }) {
@@ -1195,6 +1170,20 @@ struct FingerTrackerApp {
     grid_rows: u32,
     /// Characters on the board
     characters: Arc<Mutex<Vec<Character>>>,
+    /// Current drag-and-drop state
+    drag_state: DragState,
+    /// Last time pinch was detected (for flicker tolerance)
+    last_pinch_detected: Option<Instant>,
+    /// Last pinch position (for flicker tolerance)
+    last_pinch_position: Option<(f32, f32)>,
+    /// Drag-and-drop timing: time before showing loading bar (ms)
+    pinch_show_loading_ms: u64,
+    /// Drag-and-drop timing: additional time to complete pickup (ms)
+    pinch_pickup_ms: u64,
+    /// Drag-and-drop timing: tolerance for tracking flicker (ms)
+    pinch_flicker_tolerance_ms: u64,
+    /// Drag-and-drop timing: time to confirm drop (ms)
+    drop_confirm_ms: u64,
 }
 
 impl FingerTrackerApp {
@@ -1249,6 +1238,13 @@ impl FingerTrackerApp {
             show_grid: true,
             grid_rows: default_grid_rows,
             characters: Arc::new(Mutex::new(characters)),
+            drag_state: DragState::Idle,
+            last_pinch_detected: None,
+            last_pinch_position: None,
+            pinch_show_loading_ms: DEFAULT_PINCH_SHOW_LOADING_MS,
+            pinch_pickup_ms: DEFAULT_PINCH_PICKUP_MS,
+            pinch_flicker_tolerance_ms: DEFAULT_PINCH_FLICKER_TOLERANCE_MS,
+            drop_confirm_ms: DEFAULT_DROP_CONFIRM_MS,
         }
     }
     
@@ -1347,6 +1343,89 @@ impl FingerTrackerApp {
             images.pop();
         }
     }
+    
+    /// Convert projector coordinates to grid cell (column, row)
+    fn projector_to_grid_cell(&self, px: f32, py: f32, rect: &egui::Rect) -> Option<(u32, u32)> {
+        let cell_size = rect.height() / self.grid_rows as f32;
+        let num_cols = (rect.width() / cell_size).ceil() as u32;
+        
+        // Convert to relative coordinates within the rect
+        let rel_x = px - rect.min.x;
+        let rel_y = py - rect.min.y;
+        
+        if rel_x < 0.0 || rel_y < 0.0 {
+            return None;
+        }
+        
+        let col = (rel_x / cell_size) as u32;
+        let row = (rel_y / cell_size) as u32;
+        
+        if col < num_cols && row < self.grid_rows {
+            Some((col, row))
+        } else {
+            None
+        }
+    }
+    
+    /// Find character at a given grid cell
+    fn find_character_at_cell(&self, cell: (u32, u32)) -> Option<usize> {
+        let chars = self.characters.lock().unwrap();
+        for (i, char) in chars.iter().enumerate() {
+            if char.visible && char.grid_pos == cell {
+                return Some(i);
+            }
+        }
+        None
+    }
+    
+    /// Draw a circular loading indicator
+    fn draw_loading_circle(
+        painter: &egui::Painter,
+        center: egui::Pos2,
+        radius: f32,
+        progress: f32, // 0.0 to 1.0
+        color: egui::Color32,
+        stroke_width: f32,
+    ) {
+        use std::f32::consts::PI;
+        
+        // Background circle (dim)
+        painter.circle_stroke(
+            center,
+            radius,
+            egui::Stroke::new(stroke_width, egui::Color32::from_rgba_unmultiplied(
+                color.r(), color.g(), color.b(), 60
+            )),
+        );
+        
+        // Progress arc
+        let start_angle = -PI / 2.0; // Start from top
+        let end_angle = start_angle + 2.0 * PI * progress;
+        
+        // Draw arc as small line segments
+        let segments = 32;
+        let angle_step = (end_angle - start_angle) / segments as f32;
+        
+        for i in 0..segments {
+            let a1 = start_angle + i as f32 * angle_step;
+            let a2 = start_angle + (i + 1) as f32 * angle_step;
+            
+            if a2 > end_angle {
+                break;
+            }
+            
+            let p1 = egui::pos2(
+                center.x + radius * a1.cos(),
+                center.y + radius * a1.sin(),
+            );
+            let p2 = egui::pos2(
+                center.x + radius * a2.cos(),
+                center.y + radius * a2.sin(),
+            );
+            
+            painter.line_segment([p1, p2], egui::Stroke::new(stroke_width, color));
+        }
+    }
 }
 
 fn options_viewport_id() -> egui::ViewportId {
@@ -1396,6 +1475,10 @@ impl eframe::App for FingerTrackerApp {
             let show_grid = Arc::new(Mutex::new(self.show_grid));
             let grid_rows = Arc::new(Mutex::new(self.grid_rows));
             let characters = self.characters.clone();
+            let pinch_show_loading_ms = Arc::new(Mutex::new(self.pinch_show_loading_ms));
+            let pinch_pickup_ms = Arc::new(Mutex::new(self.pinch_pickup_ms));
+            let pinch_flicker_tolerance_ms = Arc::new(Mutex::new(self.pinch_flicker_tolerance_ms));
+            let drop_confirm_ms = Arc::new(Mutex::new(self.drop_confirm_ms));
 
             // Clone Arcs for the closure
             let show_camera_feed_c = show_camera_feed.clone();
@@ -1415,6 +1498,10 @@ impl eframe::App for FingerTrackerApp {
             let show_grid_c = show_grid.clone();
             let grid_rows_c = grid_rows.clone();
             let characters_c = characters.clone();
+            let pinch_show_loading_ms_c = pinch_show_loading_ms.clone();
+            let pinch_pickup_ms_c = pinch_pickup_ms.clone();
+            let pinch_flicker_tolerance_ms_c = pinch_flicker_tolerance_ms.clone();
+            let drop_confirm_ms_c = drop_confirm_ms.clone();
 
             ctx.show_viewport_immediate(
                 options_viewport_id(),
@@ -1518,6 +1605,26 @@ impl eframe::App for FingerTrackerApp {
                                         ui.add_space(2.0);
                                     }
                                 }
+                            }
+
+                            ui.separator();
+                            ui.heading("🎯 Drag & Drop Timing");
+                            ui.small("Adjust timing for character drag-and-drop");
+                            {
+                                let mut val = pinch_show_loading_ms_c.lock().unwrap();
+                                ui.add(egui::Slider::new(&mut *val, 100..=1000).text("Show loading delay (ms)"));
+                            }
+                            {
+                                let mut val = pinch_pickup_ms_c.lock().unwrap();
+                                ui.add(egui::Slider::new(&mut *val, 200..=3000).text("Pickup duration (ms)"));
+                            }
+                            {
+                                let mut val = pinch_flicker_tolerance_ms_c.lock().unwrap();
+                                ui.add(egui::Slider::new(&mut *val, 50..=500).text("Flicker tolerance (ms)"));
+                            }
+                            {
+                                let mut val = drop_confirm_ms_c.lock().unwrap();
+                                ui.add(egui::Slider::new(&mut *val, 100..=2000).text("Drop confirm (ms)"));
                             }
 
                             ui.separator();
@@ -2245,6 +2352,10 @@ impl eframe::App for FingerTrackerApp {
             self.image_gen_prompt = image_gen_prompt.lock().unwrap().clone();
             self.show_grid = *show_grid.lock().unwrap();
             self.grid_rows = *grid_rows.lock().unwrap();
+            self.pinch_show_loading_ms = *pinch_show_loading_ms.lock().unwrap();
+            self.pinch_pickup_ms = *pinch_pickup_ms.lock().unwrap();
+            self.pinch_flicker_tolerance_ms = *pinch_flicker_tolerance_ms.lock().unwrap();
+            self.drop_confirm_ms = *drop_confirm_ms.lock().unwrap();
             
             // Check if we need to use the default background
             if *use_default_background.lock().unwrap() {
@@ -2356,7 +2467,7 @@ impl eframe::App for FingerTrackerApp {
             } else {
                 // Projector output mode - black background with finger circle
                 // This is what gets displayed on the projector
-                let (finger_projector, calib_state, calib_point, dot_radius, ripples, is_pinching) = {
+                let (finger_projector, calib_state, calib_point, dot_radius, is_pinching) = {
                     let state = self.state.lock().unwrap();
                     let calib_point = match state.calibration.state {
                         CalibrationState::DisplayingDot { index, .. } |
@@ -2370,7 +2481,6 @@ impl eframe::App for FingerTrackerApp {
                         state.calibration.state.clone(),
                         calib_point,
                         state.calibration.dot_radius,
-                        state.ripples.clone(),
                         state.is_pinching,
                     )
                 };
@@ -2434,14 +2544,231 @@ impl eframe::App for FingerTrackerApp {
                 }
                 
                 // Draw characters on the grid
+                let dragged_char_index: Option<usize>;
+                let drag_position: Option<(f32, f32)>;
                 {
                     let cell_size = rect.height() / self.grid_rows as f32;
+                    
+                    // Handle drag-and-drop state machine
+                    let now = Instant::now();
+                    
+                    // Check if pinch is currently active (with flicker tolerance)
+                    let pinch_active = if is_pinching {
+                        if let Some(fp) = finger_projector {
+                            self.last_pinch_detected = Some(now);
+                            self.last_pinch_position = Some(fp);
+                        }
+                        true
+                    } else if let Some(last_time) = self.last_pinch_detected {
+                        // Allow brief flicker - consider pinch still active if within tolerance
+                        now.duration_since(last_time).as_millis() < self.pinch_flicker_tolerance_ms as u128
+                    } else {
+                        false
+                    };
+                    
+                    // Get current pinch position (use last known if flickering)
+                    let pinch_pos = if is_pinching {
+                        finger_projector
+                    } else {
+                        self.last_pinch_position
+                    };
+                    
+                    // State machine transitions - compute new state first to avoid borrow issues
+                    let new_state = match self.drag_state.clone() {
+                        DragState::Idle => {
+                            if pinch_active {
+                                if let Some(pos) = pinch_pos {
+                                    Some(DragState::PinchStarted {
+                                        start_time: now,
+                                        position: pos,
+                                    })
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        DragState::PinchStarted { start_time, position } => {
+                            if !pinch_active {
+                                self.last_pinch_detected = None;
+                                self.last_pinch_position = None;
+                                Some(DragState::Idle)
+                            } else {
+                                let elapsed_ms = now.duration_since(start_time).as_millis() as u64;
+                                if elapsed_ms >= self.pinch_show_loading_ms {
+                                    // Check if there's a character at this position
+                                    let screen_pos = (
+                                        rect.min.x + position.0 * (available_size.x / self.projector_width),
+                                        rect.min.y + position.1 * (available_size.y / self.projector_height),
+                                    );
+                                    if let Some(cell) = self.projector_to_grid_cell(screen_pos.0, screen_pos.1, &rect) {
+                                        if let Some(char_idx) = self.find_character_at_cell(cell) {
+                                            Some(DragState::PickingUp {
+                                                start_time,
+                                                position: pinch_pos.unwrap_or(position),
+                                                character_index: char_idx,
+                                            })
+                                        } else {
+                                            // No character here, reset
+                                            Some(DragState::Idle)
+                                        }
+                                    } else {
+                                        Some(DragState::Idle)
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                        }
+                        DragState::PickingUp { start_time, character_index, .. } => {
+                            if !pinch_active {
+                                self.last_pinch_detected = None;
+                                self.last_pinch_position = None;
+                                Some(DragState::Idle)
+                            } else {
+                                let elapsed_ms = now.duration_since(start_time).as_millis() as u64;
+                                let total_pickup_time = self.pinch_show_loading_ms + self.pinch_pickup_ms;
+                                if elapsed_ms >= total_pickup_time {
+                                    // Pickup complete!
+                                    let original_pos = {
+                                        let chars = self.characters.lock().unwrap();
+                                        chars[character_index].grid_pos
+                                    };
+                                    log::info!("Picked up character {}", character_index);
+                                    Some(DragState::Dragging {
+                                        character_index,
+                                        original_pos,
+                                        current_pos: pinch_pos.unwrap_or((0.0, 0.0)),
+                                    })
+                                } else {
+                                    None
+                                }
+                            }
+                        }
+                        DragState::Dragging { character_index, original_pos, .. } => {
+                            if !pinch_active {
+                                // Dropped without confirming - return to original position
+                                log::info!("Drag cancelled, returning character to original position");
+                                self.last_pinch_detected = None;
+                                self.last_pinch_position = None;
+                                Some(DragState::Idle)
+                            } else if let Some(pos) = pinch_pos {
+                                // Update position
+                                let screen_pos = (
+                                    rect.min.x + pos.0 * (available_size.x / self.projector_width),
+                                    rect.min.y + pos.1 * (available_size.y / self.projector_height),
+                                );
+                                
+                                // Check if we're over a valid cell
+                                if let Some(target_cell) = self.projector_to_grid_cell(screen_pos.0, screen_pos.1, &rect) {
+                                    // Check if this cell is different from original and not occupied
+                                    let cell_occupied = self.find_character_at_cell(target_cell)
+                                        .map(|idx| idx != character_index)
+                                        .unwrap_or(false);
+                                    
+                                    if !cell_occupied && target_cell != original_pos {
+                                        // Start drop confirmation
+                                        Some(DragState::DroppingOff {
+                                            start_time: now,
+                                            character_index,
+                                            original_pos,
+                                            target_cell,
+                                            position: pos,
+                                        })
+                                    } else {
+                                        // Update drag position
+                                        Some(DragState::Dragging {
+                                            character_index,
+                                            original_pos,
+                                            current_pos: pos,
+                                        })
+                                    }
+                                } else {
+                                    // Update drag position
+                                    Some(DragState::Dragging {
+                                        character_index,
+                                        original_pos,
+                                        current_pos: pos,
+                                    })
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        DragState::DroppingOff { start_time, character_index, original_pos, target_cell, position } => {
+                            if !pinch_active {
+                                // Dropped without confirming - return to original position
+                                log::info!("Drop cancelled, returning character to original position");
+                                self.last_pinch_detected = None;
+                                self.last_pinch_position = None;
+                                Some(DragState::Idle)
+                            } else {
+                                let elapsed_ms = now.duration_since(start_time).as_millis() as u64;
+                                
+                                // Check if still over the same cell
+                                let current_screen_pos = pinch_pos.map(|pos| (
+                                    rect.min.x + pos.0 * (available_size.x / self.projector_width),
+                                    rect.min.y + pos.1 * (available_size.y / self.projector_height),
+                                ));
+                                
+                                let still_over_target = current_screen_pos
+                                    .and_then(|sp| self.projector_to_grid_cell(sp.0, sp.1, &rect))
+                                    .map(|cell| cell == target_cell)
+                                    .unwrap_or(false);
+                                
+                                if !still_over_target {
+                                    // Moved away from target, go back to dragging
+                                    Some(DragState::Dragging {
+                                        character_index,
+                                        original_pos,
+                                        current_pos: pinch_pos.unwrap_or(position),
+                                    })
+                                } else if elapsed_ms >= self.drop_confirm_ms {
+                                    // Drop confirmed!
+                                    {
+                                        let mut chars = self.characters.lock().unwrap();
+                                        chars[character_index].grid_pos = target_cell;
+                                    }
+                                    log::info!("Dropped character {} at {:?}", character_index, target_cell);
+                                    self.last_pinch_detected = None;
+                                    self.last_pinch_position = None;
+                                    Some(DragState::Idle)
+                                } else {
+                                    None
+                                }
+                            }
+                        }
+                    };
+                    
+                    // Apply state transition if computed
+                    if let Some(state) = new_state {
+                        self.drag_state = state;
+                    }
+                    
+                    // Extract drag info for rendering
+                    dragged_char_index = match &self.drag_state {
+                        DragState::Dragging { character_index, .. } |
+                        DragState::DroppingOff { character_index, .. } => Some(*character_index),
+                        _ => None,
+                    };
+                    
+                    drag_position = match &self.drag_state {
+                        DragState::Dragging { current_pos, .. } => Some(*current_pos),
+                        DragState::DroppingOff { position, .. } => Some(*position),
+                        _ => None,
+                    };
+                    
+                    // Draw characters
                     let mut chars = self.characters.lock().unwrap();
                     
-                    for char in chars.iter_mut() {
+                    for (char_idx, char) in chars.iter_mut().enumerate() {
                         if !char.visible {
                             continue;
                         }
+                        
+                        // Check if this character is being dragged
+                        let is_dragged = Some(char_idx) == dragged_char_index;
                         
                         let (col, row) = char.grid_pos;
                         
@@ -2456,6 +2783,22 @@ impl eframe::App for FingerTrackerApp {
                             egui::pos2(cell_x + token_margin, cell_y + token_margin),
                             egui::vec2(token_size, token_size),
                         );
+                        
+                        // If dragged, draw a ghost placeholder and skip normal rendering
+                        if is_dragged {
+                            // Draw ghost (semi-transparent circle indicating original position)
+                            ui.painter().circle_filled(
+                                token_rect.center(),
+                                token_size / 2.0,
+                                egui::Color32::from_rgba_unmultiplied(100, 100, 100, 80),
+                            );
+                            ui.painter().circle_stroke(
+                                token_rect.center(),
+                                token_size / 2.0,
+                                egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(150, 150, 150, 120)),
+                            );
+                            continue;
+                        }
                         
                         // Draw token image or placeholder
                         if let Some(ref token_img) = char.token_image {
@@ -2527,6 +2870,104 @@ impl eframe::App for FingerTrackerApp {
                             2.0,
                             egui::Stroke::new(1.0, egui::Color32::BLACK),
                         );
+                    }
+                    
+                    // Draw dragged character at drag position
+                    if let (Some(char_idx), Some(pos)) = (dragged_char_index, drag_position) {
+                        let char = &mut chars[char_idx];
+                        
+                        // Convert projector pos to screen pos
+                        let screen_x = rect.min.x + pos.0 * (available_size.x / self.projector_width);
+                        let screen_y = rect.min.y + pos.1 * (available_size.y / self.projector_height);
+                        
+                        // Center the token on the pinch point
+                        let token_margin = cell_size * 0.1;
+                        let token_size = cell_size - token_margin * 2.0;
+                        let token_rect = egui::Rect::from_center_size(
+                            egui::pos2(screen_x, screen_y),
+                            egui::vec2(token_size, token_size),
+                        );
+                        
+                        // Draw with slight transparency and glow effect
+                        let glow_color = egui::Color32::from_rgba_unmultiplied(100, 200, 255, 100);
+                        ui.painter().circle_filled(
+                            token_rect.center(),
+                            token_size * 0.6,
+                            glow_color,
+                        );
+                        
+                        if let Some(ref token_img) = char.token_image {
+                            let texture = char.token_texture.get_or_insert_with(|| {
+                                ctx.load_texture(
+                                    format!("token_{}", char.config.name),
+                                    token_img.clone(),
+                                    egui::TextureOptions::LINEAR,
+                                )
+                            });
+                            
+                            ui.painter().image(
+                                texture.id(),
+                                token_rect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+                        } else {
+                            ui.painter().circle_filled(
+                                token_rect.center(),
+                                token_size / 2.0,
+                                egui::Color32::from_rgb(100, 100, 150),
+                            );
+                            ui.painter().text(
+                                token_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                &char.config.name.chars().next().unwrap_or('?').to_string(),
+                                egui::FontId::proportional(token_size * 0.5),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                    }
+                }
+                
+                // Draw pickup/drop loading indicators
+                {
+                    let cell_size = rect.height() / self.grid_rows as f32;
+                    let loading_radius = cell_size * 0.4;
+                    
+                    match &self.drag_state {
+                        DragState::PickingUp { start_time, position, .. } => {
+                            let elapsed_ms = Instant::now().duration_since(*start_time).as_millis() as u64;
+                            let progress_ms = elapsed_ms.saturating_sub(self.pinch_show_loading_ms);
+                            let progress = (progress_ms as f32 / self.pinch_pickup_ms as f32).min(1.0);
+                            
+                            let screen_x = rect.min.x + position.0 * (available_size.x / self.projector_width);
+                            let screen_y = rect.min.y + position.1 * (available_size.y / self.projector_height);
+                            
+                            Self::draw_loading_circle(
+                                ui.painter(),
+                                egui::pos2(screen_x, screen_y),
+                                loading_radius,
+                                progress,
+                                egui::Color32::from_rgb(255, 100, 100), // Red for pickup
+                                4.0,
+                            );
+                        }
+                        DragState::DroppingOff { start_time, position, .. } => {
+                            let elapsed_ms = Instant::now().duration_since(*start_time).as_millis() as u64;
+                            let progress = (elapsed_ms as f32 / self.drop_confirm_ms as f32).min(1.0);
+                            
+                            let screen_x = rect.min.x + position.0 * (available_size.x / self.projector_width);
+                            let screen_y = rect.min.y + position.1 * (available_size.y / self.projector_height);
+                            
+                            Self::draw_loading_circle(
+                                ui.painter(),
+                                egui::pos2(screen_x, screen_y),
+                                loading_radius,
+                                progress,
+                                egui::Color32::from_rgb(100, 255, 100), // Green for drop
+                                4.0,
+                            );
+                        }
+                        _ => {}
                     }
                 }
                 
@@ -2680,44 +3121,6 @@ impl eframe::App for FingerTrackerApp {
                                 self.circle_radius,
                                 egui::Stroke::new(3.0, egui::Color32::WHITE),
                             );
-                        }
-                        
-                        // Draw ripple effects
-                        for ripple in &ripples {
-                            let elapsed = ripple.start_time.elapsed().as_secs_f32();
-                            let progress = (elapsed / ripple.duration).min(1.0);
-                            
-                            // Convert projector coords to screen coords
-                            let screen_x = rect.min.x + ripple.center.0 * scale_x;
-                            let screen_y = rect.min.y + ripple.center.1 * scale_y;
-                            
-                            // Draw multiple concentric rings for wave effect
-                            let num_rings = 3;
-                            for i in 0..num_rings {
-                                let ring_offset = (i as f32 / num_rings as f32) * 0.3; // Spread rings
-                                let ring_progress = (progress - ring_offset).max(0.0).min(1.0);
-                                
-                                if ring_progress > 0.0 {
-                                    let ring_radius = ring_progress * ripple.max_radius * scale_x.min(scale_y);
-                                    let ring_alpha = ((1.0 - ring_progress) * 200.0) as u8;
-                                    
-                                    let color = egui::Color32::from_rgba_unmultiplied(
-                                        ripple.color.r(),
-                                        ripple.color.g(),
-                                        ripple.color.b(),
-                                        ring_alpha,
-                                    );
-                                    
-                                    // Stroke width decreases as ring expands
-                                    let stroke_width = (1.0 - ring_progress) * 4.0 + 1.0;
-                                    
-                                    ui.painter().circle_stroke(
-                                        egui::pos2(screen_x, screen_y),
-                                        ring_radius,
-                                        egui::Stroke::new(stroke_width, color),
-                                    );
-                                }
-                            }
                         }
                     }
                 }
