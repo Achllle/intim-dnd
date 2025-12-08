@@ -1,12 +1,11 @@
-# Finger Tracker
+# Interactive & Immersive DnD
 
-A camera-projector finger tracking application that uses MediaPipe hand landmark detection to track fingertip positions and map them to projector coordinates.
+Attach any USB webcam to a projector to project an interactive Dungeons and Dragons (or similar) game world onto a table-top surface. Interact with the game using intuitive hand gestures. Generate worlds using generative models.
 
 ## Features
 
 - **Hand Tracking**: Uses MediaPipe hand landmarks via Python subprocess
-- **Pinch Detection**: Detects thumb-index finger pinch gesture and creates ripple wave effects
-- **Background Images**: Display custom background images from the assets folder
+- **Pinch Detection**: Detects thumb-index finger pinch gesture and allows moving characters
 - **AI Image Generation**: Generate background images using Google Gemini API
 
 ## Prerequisites
@@ -15,6 +14,7 @@ A camera-projector finger tracking application that uses MediaPipe hand landmark
 - Python 3.10+
 - OpenCV
 - A webcam
+- a top-down HDMI projector or table-top monitor
 
 ## Setup
 
@@ -68,8 +68,6 @@ To enable AI background image generation:
 - `src/hand_tracker.rs` - Hand tracking module using MediaPipe via Python subprocess
 - `hand_detect.py` - Python script for MediaPipe hand landmark detection
 - `models/hand_landmarker.task` - MediaPipe hand landmarker model (download separately)
-- `assets/cave-map.jpg` - Default background image
-- `assets/generated_background.png` - AI-generated background (created when using image generation)
 
 ## Configuration
 
@@ -78,4 +76,3 @@ Configuration files are stored in `~/.config/finger_tracker/`:
 - `homography.txt` - Camera-to-projector transformation matrix
 - `camera_roi.txt` - Region of interest for hand detection
 - `gemini_api_token.txt` - Gemini API token for image generation (optional)
-
