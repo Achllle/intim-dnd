@@ -11,7 +11,7 @@ use opencv::{
     prelude::*,
     videoio::{self, VideoCapture, CAP_V4L2},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -118,6 +118,104 @@ const DEFAULT_PINCH_SHOW_LOADING_MS: u64 = 300;    // Time before showing loadin
 const DEFAULT_PINCH_PICKUP_MS: u64 = 1000;          // Additional time to complete pickup
 const DEFAULT_PINCH_FLICKER_TOLERANCE_MS: u64 = 200; // Tolerance for tracking flicker
 const DEFAULT_DROP_CONFIRM_MS: u64 = 500;           // Time to confirm drop
+
+/// Persistent application settings
+#[derive(Serialize, Deserialize, Clone)]
+struct AppSettings {
+    /// Circle radius for finger indicator
+    circle_radius: f32,
+    /// Circle color (RGBA)
+    circle_color: [u8; 4],
+    /// Projector output width
+    projector_width: f32,
+    /// Projector output height
+    projector_height: f32,
+    /// Whether to show grid overlay
+    show_grid: bool,
+    /// Number of rows in the grid
+    grid_rows: u32,
+    /// Drag timing: time before showing loading bar (ms)
+    pinch_show_loading_ms: u64,
+    /// Drag timing: additional time to complete pickup (ms)
+    pinch_pickup_ms: u64,
+    /// Drag timing: tolerance for tracking flicker (ms)
+    pinch_flicker_tolerance_ms: u64,
+    /// Drag timing: time to confirm drop (ms)
+    drop_confirm_ms: u64,
+    /// Path to the current background image (if any)
+    background_image_path: Option<String>,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            circle_radius: 30.0,
+            circle_color: [255, 100, 100, 255],
+            projector_width: 1920.0,
+            projector_height: 1080.0,
+            show_grid: true,
+            grid_rows: 10,
+            pinch_show_loading_ms: DEFAULT_PINCH_SHOW_LOADING_MS,
+            pinch_pickup_ms: DEFAULT_PINCH_PICKUP_MS,
+            pinch_flicker_tolerance_ms: DEFAULT_PINCH_FLICKER_TOLERANCE_MS,
+            drop_confirm_ms: DEFAULT_DROP_CONFIRM_MS,
+            background_image_path: None,
+        }
+    }
+}
+
+/// Get the path to the settings file
+fn get_settings_file_path() -> PathBuf {
+    dirs::config_dir()
+        .map(|d| d.join("intim-dnd/settings.json"))
+        .unwrap_or_else(|| PathBuf::from("settings.json"))
+}
+
+/// Load application settings from file
+fn load_settings() -> AppSettings {
+    let path = get_settings_file_path();
+    match fs::read_to_string(&path) {
+        Ok(content) => {
+            match serde_json::from_str(&content) {
+                Ok(settings) => {
+                    log::info!("Loaded settings from {:?}", path);
+                    settings
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse settings: {}, using defaults", e);
+                    AppSettings::default()
+                }
+            }
+        }
+        Err(_) => {
+            log::info!("No settings file found, using defaults");
+            AppSettings::default()
+        }
+    }
+}
+
+/// Save application settings to file
+fn save_settings(settings: &AppSettings) {
+    let path = get_settings_file_path();
+    
+    // Ensure config directory exists
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    
+    match serde_json::to_string_pretty(settings) {
+        Ok(content) => {
+            if let Err(e) = fs::write(&path, content) {
+                log::error!("Failed to save settings to {:?}: {}", path, e);
+            } else {
+                log::debug!("Saved settings to {:?}", path);
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to serialize settings: {}", e);
+        }
+    }
+}
 
 /// A generated image entry for the gallery
 #[derive(Clone)]
@@ -1188,10 +1286,15 @@ struct IntImDnDApp {
     pinch_flicker_tolerance_ms: u64,
     /// Drag-and-drop timing: time to confirm drop (ms)
     drop_confirm_ms: u64,
+    /// Current background image path (for saving to settings)
+    current_background_path: Option<String>,
 }
 
 impl IntImDnDApp {
     fn new(state: Arc<Mutex<SharedState>>) -> Self {
+        // Load saved settings
+        let settings = load_settings();
+        
         // Get the homography from state (may have been loaded from file)
         let homography_edit = {
             let state_lock = state.lock().unwrap();
@@ -1203,8 +1306,12 @@ impl IntImDnDApp {
             ]
         };
         
-        // Load background image
-        let background_image = Self::load_background_image("assets/default.png");
+        // Load background image (from saved path or default)
+        let background_image = if let Some(ref path) = settings.background_image_path {
+            Self::load_background_image(path).or_else(|| Self::load_background_image("assets/default.png"))
+        } else {
+            Self::load_background_image("assets/default.png")
+        };
         
         // Load Gemini API token
         let gemini_api_token = load_gemini_api_token();
@@ -1214,9 +1321,8 @@ impl IntImDnDApp {
         
         // Load characters and position them in the middle of the grid
         let mut characters = load_characters();
-        let default_grid_rows = 10u32;
-        let middle_row = default_grid_rows / 2;
-        let middle_col = default_grid_rows / 2; // Approximate middle column
+        let middle_row = settings.grid_rows / 2;
+        let middle_col = settings.grid_rows / 2; // Approximate middle column
         for (i, char) in characters.iter_mut().enumerate() {
             // Place characters adjacent to each other in the middle
             char.grid_pos = (middle_col + i as u32, middle_row);
@@ -1228,10 +1334,15 @@ impl IntImDnDApp {
             background_texture: None,
             background_image,
             show_camera_feed: false,
-            circle_radius: 30.0,
-            circle_color: egui::Color32::from_rgb(255, 100, 100),
-            projector_width: 1920.0,
-            projector_height: 1080.0,
+            circle_radius: settings.circle_radius,
+            circle_color: egui::Color32::from_rgba_unmultiplied(
+                settings.circle_color[0],
+                settings.circle_color[1],
+                settings.circle_color[2],
+                settings.circle_color[3],
+            ),
+            projector_width: settings.projector_width,
+            projector_height: settings.projector_height,
             homography_edit,
             show_options_window: true,
             gemini_api_token,
@@ -1239,17 +1350,37 @@ impl IntImDnDApp {
             image_gen_status: Arc::new(Mutex::new(ImageGenStatus::Idle)),
             generated_images: Arc::new(Mutex::new(generated_images)),
             selected_image_index: Arc::new(Mutex::new(None)),
-            show_grid: true,
-            grid_rows: default_grid_rows,
+            show_grid: settings.show_grid,
+            grid_rows: settings.grid_rows,
             characters: Arc::new(Mutex::new(characters)),
             drag_state: DragState::Idle,
             last_pinch_detected: None,
             last_pinch_position: None,
-            pinch_show_loading_ms: DEFAULT_PINCH_SHOW_LOADING_MS,
-            pinch_pickup_ms: DEFAULT_PINCH_PICKUP_MS,
-            pinch_flicker_tolerance_ms: DEFAULT_PINCH_FLICKER_TOLERANCE_MS,
-            drop_confirm_ms: DEFAULT_DROP_CONFIRM_MS,
+            pinch_show_loading_ms: settings.pinch_show_loading_ms,
+            pinch_pickup_ms: settings.pinch_pickup_ms,
+            pinch_flicker_tolerance_ms: settings.pinch_flicker_tolerance_ms,
+            drop_confirm_ms: settings.drop_confirm_ms,
+            current_background_path: settings.background_image_path,
         }
+    }
+    
+    /// Save current settings to file
+    fn save_current_settings(&self) {
+        let color = self.circle_color.to_array();
+        let settings = AppSettings {
+            circle_radius: self.circle_radius,
+            circle_color: color,
+            projector_width: self.projector_width,
+            projector_height: self.projector_height,
+            show_grid: self.show_grid,
+            grid_rows: self.grid_rows,
+            pinch_show_loading_ms: self.pinch_show_loading_ms,
+            pinch_pickup_ms: self.pinch_pickup_ms,
+            pinch_flicker_tolerance_ms: self.pinch_flicker_tolerance_ms,
+            drop_confirm_ms: self.drop_confirm_ms,
+            background_image_path: self.current_background_path.clone(),
+        };
+        save_settings(&settings);
     }
     
     /// Load a background image from file
@@ -1280,13 +1411,20 @@ impl IntImDnDApp {
         self.background_image = Self::load_background_image("assets/cave-map.jpg");
         // Clear the texture so it gets recreated with new image
         self.background_texture = None;
+        // Update current path and save settings
+        self.current_background_path = Some("assets/cave-map.jpg".to_string());
+        self.save_current_settings();
     }
     
     /// Load a specific image as background
     fn load_image_as_background(&mut self, path: &std::path::Path) {
-        self.background_image = Self::load_background_image(path.to_str().unwrap_or(""));
+        let path_str = path.to_str().unwrap_or("");
+        self.background_image = Self::load_background_image(path_str);
         // Clear the texture so it gets recreated with new image
         self.background_texture = None;
+        // Update current path and save settings
+        self.current_background_path = Some(path_str.to_string());
+        self.save_current_settings();
     }
     
     /// Load existing generated images from the config generated folder
@@ -2350,6 +2488,17 @@ impl eframe::App for IntImDnDApp {
             );
 
             // Update main app state from Arc values
+            let old_radius = self.circle_radius;
+            let old_color = self.circle_color;
+            let old_proj_width = self.projector_width;
+            let old_proj_height = self.projector_height;
+            let old_show_grid = self.show_grid;
+            let old_grid_rows = self.grid_rows;
+            let old_pinch_show_loading = self.pinch_show_loading_ms;
+            let old_pinch_pickup = self.pinch_pickup_ms;
+            let old_flicker_tolerance = self.pinch_flicker_tolerance_ms;
+            let old_drop_confirm = self.drop_confirm_ms;
+            
             self.show_camera_feed = *show_camera_feed.lock().unwrap();
             self.circle_radius = *circle_radius.lock().unwrap();
             self.circle_color = *circle_color.lock().unwrap();
@@ -2364,6 +2513,21 @@ impl eframe::App for IntImDnDApp {
             self.pinch_pickup_ms = *pinch_pickup_ms.lock().unwrap();
             self.pinch_flicker_tolerance_ms = *pinch_flicker_tolerance_ms.lock().unwrap();
             self.drop_confirm_ms = *drop_confirm_ms.lock().unwrap();
+            
+            // Save settings if any changed
+            if old_radius != self.circle_radius
+                || old_color != self.circle_color
+                || old_proj_width != self.projector_width
+                || old_proj_height != self.projector_height
+                || old_show_grid != self.show_grid
+                || old_grid_rows != self.grid_rows
+                || old_pinch_show_loading != self.pinch_show_loading_ms
+                || old_pinch_pickup != self.pinch_pickup_ms
+                || old_flicker_tolerance != self.pinch_flicker_tolerance_ms
+                || old_drop_confirm != self.drop_confirm_ms
+            {
+                self.save_current_settings();
+            }
             
             // Check if we need to use the default background
             if *use_default_background.lock().unwrap() {
