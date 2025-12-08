@@ -1200,7 +1200,7 @@ impl FingerTrackerApp {
         };
         
         // Load background image
-        let background_image = Self::load_background_image("assets/cave-map.jpg");
+        let background_image = Self::load_background_image("assets/default.png");
         
         // Load Gemini API token
         let gemini_api_token = load_gemini_api_token();
