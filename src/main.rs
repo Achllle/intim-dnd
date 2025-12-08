@@ -114,10 +114,10 @@ enum DragState {
 }
 
 /// Default drag-and-drop timing values (in milliseconds)
-const DEFAULT_PINCH_SHOW_LOADING_MS: u64 = 300;    // Time before showing loading bar
-const DEFAULT_PINCH_PICKUP_MS: u64 = 1000;          // Additional time to complete pickup
-const DEFAULT_PINCH_FLICKER_TOLERANCE_MS: u64 = 200; // Tolerance for tracking flicker
-const DEFAULT_DROP_CONFIRM_MS: u64 = 500;           // Time to confirm drop
+const DEFAULT_PINCH_SHOW_LOADING_MS: u64 = 250;    // Time before showing loading bar
+const DEFAULT_PINCH_PICKUP_MS: u64 = 300;          // Additional time to complete pickup
+const DEFAULT_PINCH_FLICKER_TOLERANCE_MS: u64 = 445; // Tolerance for tracking flicker
+const DEFAULT_DROP_CONFIRM_MS: u64 = 810;           // Time to confirm drop
 
 /// Default hover timing values (in milliseconds)
 const DEFAULT_HOVER_SHOW_INFO_MS: u64 = 500;        // Time finger must hover to show info panel
@@ -157,12 +157,12 @@ struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            circle_radius: 30.0,
-            circle_color: [255, 100, 100, 255],
+            circle_radius: 14.0,
+            circle_color: [100, 225, 255, 255],
             projector_width: 1920.0,
             projector_height: 1080.0,
             show_grid: true,
-            grid_rows: 10,
+            grid_rows: 8,
             pinch_show_loading_ms: DEFAULT_PINCH_SHOW_LOADING_MS,
             pinch_pickup_ms: DEFAULT_PINCH_PICKUP_MS,
             pinch_flicker_tolerance_ms: DEFAULT_PINCH_FLICKER_TOLERANCE_MS,
