@@ -1,5 +1,7 @@
 # Interactive & Immersive DnD
 
+![banner](assets/default.png)
+
 Attach any USB webcam to a projector to project an interactive Dungeons and Dragons (or similar) game world onto a table-top surface. Interact with the game using intuitive hand gestures. Generate worlds using generative models.
 
 ## Features
