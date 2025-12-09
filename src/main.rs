@@ -279,25 +279,56 @@ struct CharacterConfig {
     name: String,
     #[serde(default)]
     dead: bool,
+    #[serde(default)]
+    race: String,
     class: String,
     armor_class: i32,
     hit_points: i32,
     health: i32,
     token_representation: String,
     weapons: Vec<Weapon>,
+    #[serde(default)]
     current_weapon: String,
+}
+
+/// Enemy data from YAML config
+#[derive(Deserialize, Debug, Clone)]
+struct EnemyConfig {
+    name: String,
+    #[serde(default)]
+    dead: bool,
+    #[serde(rename = "type")]
+    enemy_type: String,
+    armor_class: i32,
+    hit_points: i32,
+    health: i32,
+    #[serde(default)]
+    token_representation: String,
+    #[serde(default)]
+    weapons: Vec<Weapon>,
 }
 
 /// Characters config file structure
 #[derive(Deserialize, Debug)]
 struct CharactersConfig {
+    #[serde(default)]
     characters: Vec<CharacterConfig>,
+    #[serde(default)]
+    enemies: Vec<EnemyConfig>,
 }
 
-/// Runtime character state (includes position and visibility)
+/// Entity type enum - can be either a character (player) or enemy
+#[derive(Clone)]
+enum EntityType {
+    Character(CharacterConfig),
+    Enemy(EnemyConfig),
+}
+
+/// Runtime entity state (includes position and visibility)
+/// Can represent either a character or an enemy
 #[derive(Clone)]
 struct Character {
-    config: CharacterConfig,
+    entity: EntityType,
     /// Grid position (column, row)
     grid_pos: (u32, u32),
     /// Whether the character is visible on the board
@@ -309,15 +340,33 @@ struct Character {
 }
 
 impl Character {
-    fn new(config: CharacterConfig) -> Self {
-        // Try to load token image from config folder
+    fn from_character(config: CharacterConfig) -> Self {
         let token_path = dirs::config_dir()
             .map(|d| d.join(format!("intim-dnd/token_reps/{}", config.token_representation)))
             .unwrap_or_else(|| PathBuf::from(format!("token_reps/{}", config.token_representation)));
         let token_image = Self::load_token_image(token_path.to_str().unwrap_or(""));
         
         Self {
-            config,
+            entity: EntityType::Character(config),
+            grid_pos: (0, 0),
+            visible: true,
+            token_texture: None,
+            token_image,
+        }
+    }
+    
+    fn from_enemy(config: EnemyConfig) -> Self {
+        let token_path = if !config.token_representation.is_empty() {
+            dirs::config_dir()
+                .map(|d| d.join(format!("intim-dnd/token_reps/{}", config.token_representation)))
+                .unwrap_or_else(|| PathBuf::from(format!("token_reps/{}", config.token_representation)))
+        } else {
+            PathBuf::new()
+        };
+        let token_image = Self::load_token_image(token_path.to_str().unwrap_or(""));
+        
+        Self {
+            entity: EntityType::Enemy(config),
             grid_pos: (0, 0),
             visible: true,
             token_texture: None,
@@ -327,7 +376,7 @@ impl Character {
     
     fn load_token_image(path: &str) -> Option<egui::ColorImage> {
         let path = std::path::Path::new(path);
-        if !path.exists() {
+        if !path.exists() || path.to_str().map(|s| s.is_empty()).unwrap_or(true) {
             log::warn!("Token image not found at {:?}", path);
             return None;
         }
@@ -347,16 +396,54 @@ impl Character {
         }
     }
     
+    /// Get the entity's name
+    fn name(&self) -> &str {
+        match &self.entity {
+            EntityType::Character(c) => &c.name,
+            EntityType::Enemy(e) => &e.name,
+        }
+    }
+    
+    /// Get the entity's hit points
+    fn hit_points(&self) -> i32 {
+        match &self.entity {
+            EntityType::Character(c) => c.hit_points,
+            EntityType::Enemy(e) => e.hit_points,
+        }
+    }
+    
+    /// Get the entity's current health
+    fn health(&self) -> i32 {
+        match &self.entity {
+            EntityType::Character(c) => c.health,
+            EntityType::Enemy(e) => e.health,
+        }
+    }
+    
+    /// Check if the entity is dead
+    fn is_dead(&self) -> bool {
+        match &self.entity {
+            EntityType::Character(c) => c.dead,
+            EntityType::Enemy(e) => e.dead,
+        }
+    }
+    
+    /// Check if this is an enemy
+    fn is_enemy(&self) -> bool {
+        matches!(self.entity, EntityType::Enemy(_))
+    }
+    
     /// Health percentage (0.0 - 1.0)
     fn health_percentage(&self) -> f32 {
-        if self.config.hit_points <= 0 {
+        let hp = self.hit_points();
+        if hp <= 0 {
             return 0.0;
         }
-        (self.config.health as f32 / self.config.hit_points as f32).clamp(0.0, 1.0)
+        (self.health() as f32 / hp as f32).clamp(0.0, 1.0)
     }
 }
 
-/// Load characters from YAML config file
+/// Load characters and enemies from YAML config file
 fn load_characters() -> Vec<Character> {
     let config_path = dirs::config_dir()
         .map(|d| d.join("intim-dnd/characters.yaml"))
@@ -378,7 +465,20 @@ fn load_characters() -> Vec<Character> {
         }
     };
     
-    config.characters.into_iter().map(Character::new).collect()
+    let mut entities: Vec<Character> = Vec::new();
+    
+    // Load characters first
+    for char_config in config.characters {
+        entities.push(Character::from_character(char_config));
+    }
+    
+    // Then load enemies
+    for enemy_config in config.enemies {
+        entities.push(Character::from_enemy(enemy_config));
+    }
+    
+    log::info!("Loaded {} characters and enemies", entities.len());
+    entities
 }
 
 /// Generate an image using Gemini API
@@ -1750,7 +1850,7 @@ impl eframe::App for IntImDnDApp {
                                             let thumb_size = egui::vec2(32.0, 32.0);
                                             if let Some(ref token_img) = char.token_image {
                                                 let texture = ctx.load_texture(
-                                                    format!("char_thumb_{}", char.config.name),
+                                                    format!("char_thumb_{}", char.name()),
                                                     token_img.clone(),
                                                     egui::TextureOptions::LINEAR,
                                                 );
@@ -1764,23 +1864,38 @@ impl eframe::App for IntImDnDApp {
                                             } else {
                                                 // Placeholder if no token
                                                 let (rect, _) = ui.allocate_exact_size(thumb_size, egui::Sense::hover());
-                                                ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(60));
+                                                let bg_color = if char.is_enemy() {
+                                                    egui::Color32::from_rgb(80, 40, 40) // Red tint for enemies
+                                                } else {
+                                                    egui::Color32::from_gray(60)
+                                                };
+                                                ui.painter().rect_filled(rect, 4.0, bg_color);
                                                 ui.painter().text(
                                                     rect.center(),
                                                     egui::Align2::CENTER_CENTER,
-                                                    &char.config.name.chars().next().unwrap_or('?').to_string(),
+                                                    &char.name().chars().next().unwrap_or('?').to_string(),
                                                     egui::FontId::default(),
                                                     egui::Color32::WHITE,
                                                 );
                                             }
                                             
-                                            // Character info
+                                            // Character/Enemy info
                                             ui.vertical(|ui| {
-                                                ui.label(&char.config.name);
-                                                ui.small(format!("{} - HP: {}/{}", 
-                                                    char.config.class, 
-                                                    char.config.health, 
-                                                    char.config.hit_points));
+                                                ui.label(char.name());
+                                                let info_text = match &char.entity {
+                                                    EntityType::Character(c) => {
+                                                        let race_class = if c.race.is_empty() {
+                                                            c.class.clone()
+                                                        } else {
+                                                            format!("{} {}", c.race, c.class)
+                                                        };
+                                                        format!("{} - HP: {}/{}", race_class, c.health, c.hit_points)
+                                                    }
+                                                    EntityType::Enemy(e) => {
+                                                        format!("{} - HP: {}/{}", e.enemy_type, e.health, e.hit_points)
+                                                    }
+                                                };
+                                                ui.small(info_text);
                                             });
                                         });
                                         ui.add_space(2.0);
@@ -3043,9 +3158,10 @@ impl eframe::App for IntImDnDApp {
                         // Draw token image or placeholder
                         if let Some(ref token_img) = char.token_image {
                             // Create/update texture
+                            let char_name = char.name().to_string();
                             let texture = char.token_texture.get_or_insert_with(|| {
                                 ctx.load_texture(
-                                    format!("token_{}", char.config.name),
+                                    format!("token_{}", char_name),
                                     token_img.clone(),
                                     egui::TextureOptions::LINEAR,
                                 )
@@ -3059,15 +3175,20 @@ impl eframe::App for IntImDnDApp {
                             );
                         } else {
                             // Draw placeholder circle with initial
+                            let placeholder_color = if char.is_enemy() {
+                                egui::Color32::from_rgb(150, 80, 80) // Red tint for enemies
+                            } else {
+                                egui::Color32::from_rgb(100, 100, 150)
+                            };
                             ui.painter().circle_filled(
                                 token_rect.center(),
                                 token_size / 2.0,
-                                egui::Color32::from_rgb(100, 100, 150),
+                                placeholder_color,
                             );
                             ui.painter().text(
                                 token_rect.center(),
                                 egui::Align2::CENTER_CENTER,
-                                &char.config.name.chars().next().unwrap_or('?').to_string(),
+                                &char.name().chars().next().unwrap_or('?').to_string(),
                                 egui::FontId::proportional(token_size * 0.5),
                                 egui::Color32::WHITE,
                             );
@@ -3137,9 +3258,10 @@ impl eframe::App for IntImDnDApp {
                         );
                         
                         if let Some(ref token_img) = char.token_image {
+                            let char_name = char.name().to_string();
                             let texture = char.token_texture.get_or_insert_with(|| {
                                 ctx.load_texture(
-                                    format!("token_{}", char.config.name),
+                                    format!("token_{}", char_name),
                                     token_img.clone(),
                                     egui::TextureOptions::LINEAR,
                                 )
@@ -3152,15 +3274,20 @@ impl eframe::App for IntImDnDApp {
                                 egui::Color32::WHITE,
                             );
                         } else {
+                            let placeholder_color = if char.is_enemy() {
+                                egui::Color32::from_rgb(150, 80, 80)
+                            } else {
+                                egui::Color32::from_rgb(100, 100, 150)
+                            };
                             ui.painter().circle_filled(
                                 token_rect.center(),
                                 token_size / 2.0,
-                                egui::Color32::from_rgb(100, 100, 150),
+                                placeholder_color,
                             );
                             ui.painter().text(
                                 token_rect.center(),
                                 egui::Align2::CENTER_CENTER,
-                                &char.config.name.chars().next().unwrap_or('?').to_string(),
+                                &char.name().chars().next().unwrap_or('?').to_string(),
                                 egui::FontId::proportional(token_size * 0.5),
                                 egui::Color32::WHITE,
                             );
@@ -3222,7 +3349,7 @@ impl eframe::App for IntImDnDApp {
                     }
                 }
                 
-                // Draw character info panel if active
+                // Draw character/enemy info panel if active
                 if let Some((char_idx, _)) = self.info_panel_state {
                     let chars = self.characters.lock().unwrap();
                     if let Some(char) = chars.get(char_idx) {
@@ -3232,9 +3359,13 @@ impl eframe::App for IntImDnDApp {
                         let cell_x = rect.min.x + char.grid_pos.0 as f32 * cell_size;
                         let cell_y = rect.min.y + char.grid_pos.1 as f32 * cell_size;
                         
-                        // Panel dimensions
+                        // Panel dimensions - smaller for enemies
                         let panel_width = cell_size * 3.5;
-                        let panel_height = cell_size * 2.8;
+                        let panel_height = if char.is_enemy() {
+                            cell_size * 1.2 // Smaller panel for enemies
+                        } else {
+                            cell_size * 2.8
+                        };
                         let panel_margin = cell_size * 0.2;
                         
                         // Position panel to the right of the character, or left if it would go off-screen
@@ -3260,10 +3391,17 @@ impl eframe::App for IntImDnDApp {
                             8.0,
                             egui::Color32::from_rgba_unmultiplied(20, 20, 30, 230),
                         );
+                        
+                        // Different border color for enemies vs characters
+                        let border_color = if char.is_enemy() {
+                            egui::Color32::from_rgb(200, 100, 100) // Red for enemies
+                        } else {
+                            egui::Color32::from_rgb(100, 150, 200) // Blue for characters
+                        };
                         ui.painter().rect_stroke(
                             panel_rect,
                             8.0,
-                            egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 150, 200)),
+                            egui::Stroke::new(2.0, border_color),
                         );
                         
                         // Text styling
@@ -3271,89 +3409,127 @@ impl eframe::App for IntImDnDApp {
                         let line_height = cell_size * 0.28;
                         let mut y_offset = panel_rect.min.y + padding;
                         
-                        // Character name (larger, bold)
-                        ui.painter().text(
-                            egui::pos2(panel_rect.min.x + padding, y_offset),
-                            egui::Align2::LEFT_TOP,
-                            &char.config.name,
-                            egui::FontId::proportional(line_height * 1.2),
-                            egui::Color32::from_rgb(255, 220, 100),
-                        );
-                        y_offset += line_height * 1.4;
-                        
-                        // Class
-                        ui.painter().text(
-                            egui::pos2(panel_rect.min.x + padding, y_offset),
-                            egui::Align2::LEFT_TOP,
-                            &format!("Class: {}", char.config.class),
-                            egui::FontId::proportional(line_height * 0.85),
-                            egui::Color32::from_rgb(180, 180, 200),
-                        );
-                        y_offset += line_height;
-                        
-                        // HP with color based on health
-                        let health_pct = char.health_percentage();
-                        let hp_color = if health_pct > 0.5 {
-                            egui::Color32::from_rgb(100, 255, 100)
-                        } else if health_pct > 0.25 {
-                            egui::Color32::from_rgb(255, 255, 100)
+                        // Name (larger, bold) - different color for enemies
+                        let name_color = if char.is_enemy() {
+                            egui::Color32::from_rgb(255, 150, 100) // Orange-red for enemies
                         } else {
-                            egui::Color32::from_rgb(255, 100, 100)
+                            egui::Color32::from_rgb(255, 220, 100) // Gold for characters
                         };
                         ui.painter().text(
                             egui::pos2(panel_rect.min.x + padding, y_offset),
                             egui::Align2::LEFT_TOP,
-                            &format!("HP: {} / {}", char.config.health, char.config.hit_points),
-                            egui::FontId::proportional(line_height * 0.85),
-                            hp_color,
+                            char.name(),
+                            egui::FontId::proportional(line_height * 1.2),
+                            name_color,
                         );
-                        y_offset += line_height;
+                        y_offset += line_height * 1.4;
                         
-                        // Armor Class
-                        ui.painter().text(
-                            egui::pos2(panel_rect.min.x + padding, y_offset),
-                            egui::Align2::LEFT_TOP,
-                            &format!("AC: {}", char.config.armor_class),
-                            egui::FontId::proportional(line_height * 0.85),
-                            egui::Color32::from_rgb(150, 200, 255),
-                        );
-                        y_offset += line_height;
-                        
-                        // Current weapon
-                        ui.painter().text(
-                            egui::pos2(panel_rect.min.x + padding, y_offset),
-                            egui::Align2::LEFT_TOP,
-                            &format!("Weapon: {}", char.config.current_weapon),
-                            egui::FontId::proportional(line_height * 0.85),
-                            egui::Color32::from_rgb(255, 180, 150),
-                        );
-                        y_offset += line_height;
-                        
-                        // Find weapon details
-                        if let Some(weapon) = char.config.weapons.iter().find(|w| w.name == char.config.current_weapon) {
-                            let modifier_str = if weapon.modifier >= 0 {
-                                format!("+{}", weapon.modifier)
-                            } else {
-                                format!("{}", weapon.modifier)
-                            };
-                            ui.painter().text(
-                                egui::pos2(panel_rect.min.x + padding, y_offset),
-                                egui::Align2::LEFT_TOP,
-                                &format!("  {} ({})", weapon.damage, modifier_str),
-                                egui::FontId::proportional(line_height * 0.75),
-                                egui::Color32::from_rgb(200, 150, 130),
-                            );
-                        }
-                        
-                        // Status indicator if dead
-                        if char.config.dead {
-                            ui.painter().text(
-                                egui::pos2(panel_rect.center().x, panel_rect.max.y - padding),
-                                egui::Align2::CENTER_BOTTOM,
-                                "☠️ DEAD",
-                                egui::FontId::proportional(line_height * 0.9),
-                                egui::Color32::from_rgb(255, 50, 50),
-                            );
+                        // Display content based on entity type
+                        match &char.entity {
+                            EntityType::Character(config) => {
+                                // Race + Class for characters
+                                let race_class = if config.race.is_empty() {
+                                    config.class.clone()
+                                } else {
+                                    format!("{} {}", config.race, config.class)
+                                };
+                                ui.painter().text(
+                                    egui::pos2(panel_rect.min.x + padding, y_offset),
+                                    egui::Align2::LEFT_TOP,
+                                    &race_class,
+                                    egui::FontId::proportional(line_height * 0.85),
+                                    egui::Color32::from_rgb(180, 180, 200),
+                                );
+                                y_offset += line_height;
+                                
+                                // HP with color based on health
+                                let health_pct = char.health_percentage();
+                                let hp_color = if health_pct > 0.5 {
+                                    egui::Color32::from_rgb(100, 255, 100)
+                                } else if health_pct > 0.25 {
+                                    egui::Color32::from_rgb(255, 255, 100)
+                                } else {
+                                    egui::Color32::from_rgb(255, 100, 100)
+                                };
+                                ui.painter().text(
+                                    egui::pos2(panel_rect.min.x + padding, y_offset),
+                                    egui::Align2::LEFT_TOP,
+                                    &format!("HP: {} / {}", config.health, config.hit_points),
+                                    egui::FontId::proportional(line_height * 0.85),
+                                    hp_color,
+                                );
+                                y_offset += line_height;
+                                
+                                // Armor Class
+                                ui.painter().text(
+                                    egui::pos2(panel_rect.min.x + padding, y_offset),
+                                    egui::Align2::LEFT_TOP,
+                                    &format!("AC: {}", config.armor_class),
+                                    egui::FontId::proportional(line_height * 0.85),
+                                    egui::Color32::from_rgb(150, 200, 255),
+                                );
+                                y_offset += line_height;
+                                
+                                // Current weapon
+                                if !config.current_weapon.is_empty() {
+                                    ui.painter().text(
+                                        egui::pos2(panel_rect.min.x + padding, y_offset),
+                                        egui::Align2::LEFT_TOP,
+                                        &format!("Weapon: {}", config.current_weapon),
+                                        egui::FontId::proportional(line_height * 0.85),
+                                        egui::Color32::from_rgb(255, 180, 150),
+                                    );
+                                    y_offset += line_height;
+                                    
+                                    // Find weapon details
+                                    if let Some(weapon) = config.weapons.iter().find(|w| w.name == config.current_weapon) {
+                                        let modifier_str = if weapon.modifier >= 0 {
+                                            format!("+{}", weapon.modifier)
+                                        } else {
+                                            format!("{}", weapon.modifier)
+                                        };
+                                        ui.painter().text(
+                                            egui::pos2(panel_rect.min.x + padding, y_offset),
+                                            egui::Align2::LEFT_TOP,
+                                            &format!("  {} ({})", weapon.damage, modifier_str),
+                                            egui::FontId::proportional(line_height * 0.75),
+                                            egui::Color32::from_rgb(200, 150, 130),
+                                        );
+                                    }
+                                }
+                                
+                                // Status indicator if dead
+                                if config.dead {
+                                    ui.painter().text(
+                                        egui::pos2(panel_rect.center().x, panel_rect.max.y - padding),
+                                        egui::Align2::CENTER_BOTTOM,
+                                        "☠️ DEAD",
+                                        egui::FontId::proportional(line_height * 0.9),
+                                        egui::Color32::from_rgb(255, 50, 50),
+                                    );
+                                }
+                            }
+                            EntityType::Enemy(config) => {
+                                // Type only for enemies (simpler display)
+                                ui.painter().text(
+                                    egui::pos2(panel_rect.min.x + padding, y_offset),
+                                    egui::Align2::LEFT_TOP,
+                                    &config.enemy_type,
+                                    egui::FontId::proportional(line_height * 0.85),
+                                    egui::Color32::from_rgb(200, 150, 150),
+                                );
+                                
+                                // Status indicator if dead
+                                if config.dead {
+                                    ui.painter().text(
+                                        egui::pos2(panel_rect.center().x, panel_rect.max.y - padding),
+                                        egui::Align2::CENTER_BOTTOM,
+                                        "☠️ DEAD",
+                                        egui::FontId::proportional(line_height * 0.9),
+                                        egui::Color32::from_rgb(255, 50, 50),
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -3570,7 +3746,7 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // Camera device path - change this if your camera is at a different device
-    let device_path = "/dev/video5";
+    let device_path = "/dev/video4";
 
     log::info!("Starting IntIm-DnD application");
     log::info!("Camera device: {}", device_path);
