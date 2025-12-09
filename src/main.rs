@@ -1454,6 +1454,8 @@ struct IntImDnDApp {
     hover_state: Option<(usize, Instant)>,
     /// Info panel state: character to show info for and when to hide
     info_panel_state: Option<(usize, Instant)>,
+    /// Weapon hover state: (character index, weapon index, hover start time)
+    weapon_hover_state: Option<(usize, usize, Instant)>,
     /// Whether to show the calibration settings window
     show_calibration_window: bool,
 }
@@ -1533,6 +1535,7 @@ impl IntImDnDApp {
             hover_info_display_ms: settings.hover_info_display_ms,
             hover_state: None,
             info_panel_state: None,
+            weapon_hover_state: None,
             show_calibration_window: false,
         }
     }
@@ -3459,6 +3462,9 @@ impl eframe::App for IntImDnDApp {
                 }
                 
                 // Draw character/enemy info panel if active
+                // First pass: collect data needed for rendering
+                let mut weapon_to_select: Option<(usize, usize)> = None; // (char_idx, weapon_idx)
+                
                 if let Some((char_idx, _)) = self.info_panel_state {
                     let chars = self.characters.lock().unwrap();
                     if let Some(char) = chars.get(char_idx) {
@@ -3468,12 +3474,17 @@ impl eframe::App for IntImDnDApp {
                         let cell_x = rect.min.x + char.grid_pos.0 as f32 * cell_size;
                         let cell_y = rect.min.y + char.grid_pos.1 as f32 * cell_size;
                         
-                        // Panel dimensions - smaller for enemies
+                        // Panel dimensions - adjust for weapon buttons
                         let panel_width = cell_size * 3.5;
+                        let num_weapons = match &char.entity {
+                            EntityType::Character(c) => c.weapons.len(),
+                            EntityType::Enemy(_) => 0,
+                        };
                         let panel_height = if char.is_enemy() {
                             cell_size * 1.2 // Smaller panel for enemies
                         } else {
-                            cell_size * 2.8
+                            // Base height + extra for weapon buttons
+                            cell_size * 2.2 + (num_weapons as f32 * cell_size * 0.45)
                         };
                         let panel_margin = cell_size * 0.2;
                         
@@ -3577,33 +3588,150 @@ impl eframe::App for IntImDnDApp {
                                     egui::FontId::proportional(line_height * 0.85),
                                     egui::Color32::from_rgb(150, 200, 255),
                                 );
-                                y_offset += line_height;
+                                y_offset += line_height * 1.2;
                                 
-                                // Current weapon
-                                if !config.current_weapon.is_empty() {
+                                // Weapon buttons section
+                                if !config.weapons.is_empty() {
                                     ui.painter().text(
                                         egui::pos2(panel_rect.min.x + padding, y_offset),
                                         egui::Align2::LEFT_TOP,
-                                        &format!("Weapon: {}", config.current_weapon),
-                                        egui::FontId::proportional(line_height * 0.85),
-                                        egui::Color32::from_rgb(255, 180, 150),
+                                        "Weapons:",
+                                        egui::FontId::proportional(line_height * 0.75),
+                                        egui::Color32::from_rgb(180, 180, 180),
                                     );
-                                    y_offset += line_height;
+                                    y_offset += line_height * 0.9;
                                     
-                                    // Find weapon details
-                                    if let Some(weapon) = config.weapons.iter().find(|w| w.name == config.current_weapon) {
+                                    // Get hover position in screen coordinates
+                                    let hover_screen_pos: Option<egui::Pos2> = hover_position.map(|(px, py)| {
+                                        egui::pos2(
+                                            rect.min.x + px * (available_size.x / self.projector_width),
+                                            rect.min.y + py * (available_size.y / self.projector_height),
+                                        )
+                                    });
+                                    
+                                    let button_height = line_height * 1.3;
+                                    let button_width = panel_width - padding * 2.0;
+                                    
+                                    for (weapon_idx, weapon) in config.weapons.iter().enumerate() {
+                                        let button_rect = egui::Rect::from_min_size(
+                                            egui::pos2(panel_rect.min.x + padding, y_offset),
+                                            egui::vec2(button_width, button_height),
+                                        );
+                                        
+                                        let is_current = config.current_weapon == weapon.name;
+                                        let is_hovered = hover_screen_pos.map(|p| button_rect.contains(p)).unwrap_or(false);
+                                        
+                                        // Check weapon hover timing
+                                        if is_hovered && !is_current {
+                                            match self.weapon_hover_state {
+                                                Some((prev_char, prev_weapon, start_time)) 
+                                                    if prev_char == char_idx && prev_weapon == weapon_idx => {
+                                                    // Still hovering over the same weapon
+                                                    let hover_duration = now.duration_since(start_time).as_millis() as u64;
+                                                    if hover_duration >= self.hover_show_info_ms {
+                                                        // Select this weapon!
+                                                        weapon_to_select = Some((char_idx, weapon_idx));
+                                                    }
+                                                }
+                                                _ => {
+                                                    // Started hovering over a new weapon
+                                                    self.weapon_hover_state = Some((char_idx, weapon_idx, now));
+                                                }
+                                            }
+                                        }
+                                        
+                                        // Calculate hover progress for visual feedback
+                                        let hover_progress = if is_hovered && !is_current {
+                                            if let Some((prev_char, prev_weapon, start_time)) = self.weapon_hover_state {
+                                                if prev_char == char_idx && prev_weapon == weapon_idx {
+                                                    let elapsed = now.duration_since(start_time).as_millis() as f32;
+                                                    (elapsed / self.hover_show_info_ms as f32).min(1.0)
+                                                } else {
+                                                    0.0
+                                                }
+                                            } else {
+                                                0.0
+                                            }
+                                        } else {
+                                            0.0
+                                        };
+                                        
+                                        // Draw button background
+                                        let bg_color = if is_current {
+                                            egui::Color32::from_rgb(60, 100, 60) // Green for active
+                                        } else if is_hovered {
+                                            // Interpolate color based on hover progress
+                                            let r = (50.0 + hover_progress * 30.0) as u8;
+                                            let g = (50.0 + hover_progress * 50.0) as u8;
+                                            let b = (70.0 - hover_progress * 20.0) as u8;
+                                            egui::Color32::from_rgb(r, g, b)
+                                        } else {
+                                            egui::Color32::from_rgb(40, 40, 55)
+                                        };
+                                        
+                                        ui.painter().rect_filled(button_rect, 4.0, bg_color);
+                                        
+                                        // Draw border - highlighted for current weapon
+                                        let border_color = if is_current {
+                                            egui::Color32::from_rgb(100, 255, 100)
+                                        } else if is_hovered {
+                                            egui::Color32::from_rgb(200, 200, 100)
+                                        } else {
+                                            egui::Color32::from_rgb(80, 80, 100)
+                                        };
+                                        ui.painter().rect_stroke(
+                                            button_rect,
+                                            4.0,
+                                            egui::Stroke::new(if is_current { 2.0 } else { 1.0 }, border_color),
+                                        );
+                                        
+                                        // Draw hover progress indicator
+                                        if hover_progress > 0.0 && !is_current {
+                                            let progress_rect = egui::Rect::from_min_size(
+                                                button_rect.min,
+                                                egui::vec2(button_width * hover_progress, button_height),
+                                            );
+                                            ui.painter().rect_filled(
+                                                progress_rect,
+                                                4.0,
+                                                egui::Color32::from_rgba_unmultiplied(100, 200, 100, 60),
+                                            );
+                                        }
+                                        
+                                        // Weapon name and stats
                                         let modifier_str = if weapon.modifier >= 0 {
                                             format!("+{}", weapon.modifier)
                                         } else {
                                             format!("{}", weapon.modifier)
                                         };
+                                        let weapon_text = format!("{} - {} ({})", weapon.name, weapon.damage, modifier_str);
+                                        
+                                        let text_color = if is_current {
+                                            egui::Color32::from_rgb(200, 255, 200)
+                                        } else {
+                                            egui::Color32::from_rgb(220, 200, 180)
+                                        };
+                                        
                                         ui.painter().text(
-                                            egui::pos2(panel_rect.min.x + padding, y_offset),
-                                            egui::Align2::LEFT_TOP,
-                                            &format!("  {} ({})", weapon.damage, modifier_str),
-                                            egui::FontId::proportional(line_height * 0.75),
-                                            egui::Color32::from_rgb(200, 150, 130),
+                                            egui::pos2(button_rect.min.x + padding * 0.5, button_rect.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            &weapon_text,
+                                            egui::FontId::proportional(line_height * 0.7),
+                                            text_color,
                                         );
+                                        
+                                        // Show checkmark for current weapon
+                                        if is_current {
+                                            ui.painter().text(
+                                                egui::pos2(button_rect.max.x - padding, button_rect.center().y),
+                                                egui::Align2::RIGHT_CENTER,
+                                                "✓",
+                                                egui::FontId::proportional(line_height * 0.9),
+                                                egui::Color32::from_rgb(100, 255, 100),
+                                            );
+                                        }
+                                        
+                                        y_offset += button_height + padding * 0.3;
                                     }
                                 }
                                 
@@ -3640,7 +3768,44 @@ impl eframe::App for IntImDnDApp {
                                 }
                             }
                         }
+                        
+                        // Reset weapon hover if not hovering over any weapon button in this panel
+                        if let Some((hover_char, _, _)) = self.weapon_hover_state {
+                            if hover_char == char_idx {
+                                // Check if we're still hovering over a weapon
+                                let still_hovering = hover_position.map(|(px, py)| {
+                                    let screen_pos = egui::pos2(
+                                        rect.min.x + px * (available_size.x / self.projector_width),
+                                        rect.min.y + py * (available_size.y / self.projector_height),
+                                    );
+                                    panel_rect.contains(screen_pos)
+                                }).unwrap_or(false);
+                                
+                                if !still_hovering {
+                                    self.weapon_hover_state = None;
+                                }
+                            }
+                        }
                     }
+                } else {
+                    // No info panel active, clear weapon hover state
+                    self.weapon_hover_state = None;
+                }
+                
+                // Apply weapon selection if triggered by hover
+                if let Some((char_idx, weapon_idx)) = weapon_to_select {
+                    let mut chars = self.characters.lock().unwrap();
+                    if let Some(char) = chars.get_mut(char_idx) {
+                        if let EntityType::Character(config) = &mut char.entity {
+                            if let Some(weapon) = config.weapons.get(weapon_idx) {
+                                config.current_weapon = weapon.name.clone();
+                                log::info!("Selected weapon: {}", config.current_weapon);
+                            }
+                        }
+                    }
+                    // Save characters after weapon change
+                    save_characters(&chars);
+                    self.weapon_hover_state = None;
                 }
                 
                 // Draw pickup/drop loading indicators
