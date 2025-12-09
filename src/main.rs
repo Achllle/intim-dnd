@@ -266,7 +266,7 @@ impl GeneratedImage {
 }
 
 /// Weapon data from YAML
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Weapon {
     name: String,
     damage: String,
@@ -274,12 +274,12 @@ struct Weapon {
 }
 
 /// Character data from YAML config
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct CharacterConfig {
     name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     dead: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     race: String,
     class: String,
     armor_class: i32,
@@ -287,33 +287,33 @@ struct CharacterConfig {
     health: i32,
     token_representation: String,
     weapons: Vec<Weapon>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     current_weapon: String,
 }
 
 /// Enemy data from YAML config
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct EnemyConfig {
     name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     dead: bool,
     #[serde(rename = "type")]
     enemy_type: String,
     armor_class: i32,
     hit_points: i32,
     health: i32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     token_representation: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     weapons: Vec<Weapon>,
 }
 
 /// Characters config file structure
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct CharactersConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     characters: Vec<CharacterConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     enemies: Vec<EnemyConfig>,
 }
 
@@ -441,6 +441,18 @@ impl Character {
         }
         (self.health() as f32 / hp as f32).clamp(0.0, 1.0)
     }
+    
+    /// Modify the entity's health by a delta (can be positive or negative)
+    fn modify_health(&mut self, delta: i32) {
+        match &mut self.entity {
+            EntityType::Character(c) => {
+                c.health = (c.health + delta).max(0).min(c.hit_points);
+            }
+            EntityType::Enemy(e) => {
+                e.health = (e.health + delta).max(0).min(e.hit_points);
+            }
+        }
+    }
 }
 
 /// Load characters and enemies from YAML config file
@@ -479,6 +491,42 @@ fn load_characters() -> Vec<Character> {
     
     log::info!("Loaded {} characters and enemies", entities.len());
     entities
+}
+
+/// Save characters and enemies to YAML config file
+fn save_characters(characters: &[Character]) {
+    let config_path = dirs::config_dir()
+        .map(|d| d.join("intim-dnd/characters.yaml"))
+        .unwrap_or_else(|| PathBuf::from("characters.yaml"));
+    
+    // Separate characters and enemies
+    let mut char_configs: Vec<CharacterConfig> = Vec::new();
+    let mut enemy_configs: Vec<EnemyConfig> = Vec::new();
+    
+    for char in characters {
+        match &char.entity {
+            EntityType::Character(c) => char_configs.push(c.clone()),
+            EntityType::Enemy(e) => enemy_configs.push(e.clone()),
+        }
+    }
+    
+    let config = CharactersConfig {
+        characters: char_configs,
+        enemies: enemy_configs,
+    };
+    
+    match serde_yaml::to_string(&config) {
+        Ok(yaml) => {
+            if let Err(e) = std::fs::write(&config_path, yaml) {
+                log::error!("Failed to save characters config: {}", e);
+            } else {
+                log::info!("Saved characters to {:?}", config_path);
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to serialize characters config: {}", e);
+        }
+    }
 }
 
 /// Generate an image using Gemini API
@@ -1837,6 +1885,8 @@ impl eframe::App for IntImDnDApp {
                             ui.heading("🎭 Characters");
                             {
                                 let mut chars = characters_c.lock().unwrap();
+                                let mut save_needed = false;
+                                
                                 if chars.is_empty() {
                                     ui.colored_label(egui::Color32::GRAY, "No characters loaded");
                                     ui.small("Add characters to ~/.config/intim-dnd/characters.yaml");
@@ -1889,17 +1939,39 @@ impl eframe::App for IntImDnDApp {
                                                         } else {
                                                             format!("{} {}", c.race, c.class)
                                                         };
-                                                        format!("{} - HP: {}/{}", race_class, c.health, c.hit_points)
+                                                        format!("{}", race_class)
                                                     }
                                                     EntityType::Enemy(e) => {
-                                                        format!("{} - HP: {}/{}", e.enemy_type, e.health, e.hit_points)
+                                                        format!("{}", e.enemy_type)
                                                     }
                                                 };
                                                 ui.small(info_text);
                                             });
+                                            
+                                            // Health adjustment buttons
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                // + button
+                                                if ui.small_button("+").clicked() {
+                                                    char.modify_health(1);
+                                                    save_needed = true;
+                                                }
+                                                // HP display
+                                                let hp_text = format!("{}/{}", char.health(), char.hit_points());
+                                                ui.label(hp_text);
+                                                // - button
+                                                if ui.small_button("-").clicked() {
+                                                    char.modify_health(-1);
+                                                    save_needed = true;
+                                                }
+                                            });
                                         });
                                         ui.add_space(2.0);
                                     }
+                                }
+                                
+                                // Save after the loop if changes were made
+                                if save_needed {
+                                    save_characters(&chars);
                                 }
                             }
 
