@@ -2815,7 +2815,34 @@ impl eframe::App for IntImDnDApp {
                 };
 
                 let available_size = ui.available_size();
-                let (rect, _response) = ui.allocate_exact_size(available_size, egui::Sense::hover());
+                let (rect, response) = ui.allocate_exact_size(available_size, egui::Sense::click_and_drag());
+                
+                // Get mouse state for board interaction
+                let mouse_pos_projector: Option<(f32, f32)> = response.hover_pos().map(|pos| {
+                    // Convert screen position to projector coordinates
+                    let rel_x = (pos.x - rect.min.x) / available_size.x * self.projector_width;
+                    let rel_y = (pos.y - rect.min.y) / available_size.y * self.projector_height;
+                    (rel_x, rel_y)
+                });
+                let mouse_clicked = response.dragged_by(egui::PointerButton::Primary) || 
+                                   ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+                
+                // Combine finger tracking with mouse input
+                // Mouse takes precedence when clicking, otherwise use finger tracking
+                let effective_position = if mouse_clicked && mouse_pos_projector.is_some() {
+                    mouse_pos_projector
+                } else if mouse_pos_projector.is_some() && !mouse_clicked {
+                    // Mouse hovering but not clicking - use for hover detection only
+                    finger_projector
+                } else {
+                    finger_projector
+                };
+                
+                let effective_pinching = if mouse_clicked && mouse_pos_projector.is_some() {
+                    true
+                } else {
+                    is_pinching
+                };
                 
                 // Draw background image or black if not available
                 if let Some(ref bg_image) = self.background_image {
@@ -2881,9 +2908,10 @@ impl eframe::App for IntImDnDApp {
                     // Handle drag-and-drop state machine
                     let now = Instant::now();
                     
-                    // Check if pinch is currently active (with flicker tolerance)
-                    let pinch_active = if is_pinching {
-                        if let Some(fp) = finger_projector {
+                    // Check if pinch/click is currently active (with flicker tolerance)
+                    // Use effective_pinching which combines mouse click and hand pinch
+                    let pinch_active = if effective_pinching {
+                        if let Some(fp) = effective_position {
                             self.last_pinch_detected = Some(now);
                             self.last_pinch_position = Some(fp);
                         }
@@ -2895,9 +2923,9 @@ impl eframe::App for IntImDnDApp {
                         false
                     };
                     
-                    // Get current pinch position (use last known if flickering)
-                    let pinch_pos = if is_pinching {
-                        finger_projector
+                    // Get current pinch/click position (use last known if flickering)
+                    let pinch_pos = if effective_pinching {
+                        effective_position
                     } else {
                         self.last_pinch_position
                     };
@@ -3295,15 +3323,24 @@ impl eframe::App for IntImDnDApp {
                     }
                 }
                 
-                // Handle hover detection for character info panel (only when not pinching/dragging)
+                // Handle hover detection for character info panel (only when not pinching/clicking/dragging)
+                // Combine finger tracking with mouse hover
                 let now = Instant::now();
-                if !is_pinching && matches!(self.drag_state, DragState::Idle) {
-                    if let Some((px, py)) = finger_projector {
-                        let cell_size = rect.height() / self.grid_rows as f32;
+                let hover_position = if mouse_pos_projector.is_some() && !mouse_clicked {
+                    // Mouse is hovering (not clicking) - use mouse position
+                    mouse_pos_projector
+                } else {
+                    // Use finger position for hover
+                    finger_projector
+                };
+                
+                if !effective_pinching && matches!(self.drag_state, DragState::Idle) {
+                    if let Some((px, py)) = hover_position {
+                        let _cell_size = rect.height() / self.grid_rows as f32;
                         let screen_x = rect.min.x + px * (available_size.x / self.projector_width);
                         let screen_y = rect.min.y + py * (available_size.y / self.projector_height);
                         
-                        // Check which character (if any) the finger is over
+                        // Check which character (if any) the pointer is over
                         let hovered_char = if let Some(cell) = self.projector_to_grid_cell(screen_x, screen_y, &rect) {
                             self.find_character_at_cell(cell)
                         } else {
@@ -3311,7 +3348,7 @@ impl eframe::App for IntImDnDApp {
                         };
                         
                         if let Some(char_idx) = hovered_char {
-                            // Finger is over a character
+                            // Pointer is over a character
                             match self.hover_state {
                                 Some((prev_idx, start_time)) if prev_idx == char_idx => {
                                     // Still hovering over the same character
@@ -3333,11 +3370,11 @@ impl eframe::App for IntImDnDApp {
                             self.hover_state = None;
                         }
                     } else {
-                        // No finger detected
+                        // No pointer detected
                         self.hover_state = None;
                     }
                 } else {
-                    // Pinching or dragging, reset hover state
+                    // Pinching/clicking or dragging, reset hover state
                     self.hover_state = None;
                 }
                 
@@ -3727,6 +3764,50 @@ impl eframe::App for IntImDnDApp {
                                 self.circle_radius,
                                 egui::Stroke::new(3.0, egui::Color32::WHITE),
                             );
+                        }
+                        
+                        // Also draw mouse cursor indicator when mouse is being used for interaction
+                        // (only if not already showing finger, and mouse is clicking or dragging)
+                        if finger_projector.is_none() || (mouse_clicked && mouse_pos_projector.is_some()) {
+                            if let Some((mx, my)) = mouse_pos_projector {
+                                let screen_x = rect.min.x + mx * scale_x;
+                                let screen_y = rect.min.y + my * scale_y;
+                                
+                                // Draw mouse cursor indicator (different style from finger)
+                                let mouse_color = if mouse_clicked {
+                                    egui::Color32::from_rgb(100, 255, 100) // Green when clicking
+                                } else {
+                                    egui::Color32::from_rgba_unmultiplied(
+                                        self.circle_color.r(),
+                                        self.circle_color.g(), 
+                                        self.circle_color.b(),
+                                        128 // Semi-transparent when just hovering
+                                    )
+                                };
+                                
+                                // Only draw if finger isn't at the same position
+                                let should_draw = if let Some((fx, fy)) = finger_projector {
+                                    let dist = ((mx - fx).powi(2) + (my - fy).powi(2)).sqrt();
+                                    dist > 50.0 // Only draw if significantly different position
+                                } else {
+                                    true
+                                };
+                                
+                                if should_draw {
+                                    ui.painter().circle_filled(
+                                        egui::pos2(screen_x, screen_y),
+                                        self.circle_radius * 0.8, // Slightly smaller than finger
+                                        mouse_color,
+                                    );
+                                    if mouse_clicked {
+                                        ui.painter().circle_stroke(
+                                            egui::pos2(screen_x, screen_y),
+                                            self.circle_radius * 0.8,
+                                            egui::Stroke::new(2.0, egui::Color32::WHITE),
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
