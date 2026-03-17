@@ -270,7 +270,8 @@ impl GeneratedImage {
 struct Weapon {
     name: String,
     damage: String,
-    modifier: i32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    attack_bonus: String,
 }
 
 /// Character data from YAML config
@@ -289,6 +290,10 @@ struct CharacterConfig {
     weapons: Vec<Weapon>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     current_weapon: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cantrips: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    spells: Vec<String>,
 }
 
 /// Enemy data from YAML config
@@ -3474,17 +3479,26 @@ impl eframe::App for IntImDnDApp {
                         let cell_x = rect.min.x + char.grid_pos.0 as f32 * cell_size;
                         let cell_y = rect.min.y + char.grid_pos.1 as f32 * cell_size;
                         
-                        // Panel dimensions - adjust for weapon buttons
-                        let panel_width = cell_size * 3.5;
-                        let num_weapons = match &char.entity {
-                            EntityType::Character(c) => c.weapons.len(),
-                            EntityType::Enemy(_) => 0,
+                        // Panel dimensions - adjust for weapon buttons and spell lists
+                        let panel_width = cell_size * 4.0;
+                        let (num_weapons, num_cantrips, num_spells) = match &char.entity {
+                            EntityType::Character(c) => (c.weapons.len(), c.cantrips.len(), c.spells.len()),
+                            EntityType::Enemy(_) => (0, 0, 0),
+                        };
+                        let spell_section_height = {
+                            let rows = num_cantrips + num_spells;
+                            if rows > 0 {
+                                let headers = if num_cantrips > 0 { 1 } else { 0 } + if num_spells > 0 { 1 } else { 0 };
+                                cell_size * 0.3 + (headers as f32 * cell_size * 0.32) + (rows as f32 * cell_size * 0.30)
+                            } else {
+                                0.0
+                            }
                         };
                         let panel_height = if char.is_enemy() {
                             cell_size * 1.2 // Smaller panel for enemies
                         } else {
-                            // Base height + extra for weapon buttons
-                            cell_size * 2.2 + (num_weapons as f32 * cell_size * 0.45)
+                            // Base height + weapon buttons + spell lists
+                            cell_size * 2.2 + (num_weapons as f32 * cell_size * 0.45) + spell_section_height
                         };
                         let panel_margin = cell_size * 0.2;
                         
@@ -3699,12 +3713,11 @@ impl eframe::App for IntImDnDApp {
                                         }
                                         
                                         // Weapon name and stats
-                                        let modifier_str = if weapon.modifier >= 0 {
-                                            format!("+{}", weapon.modifier)
+                                        let weapon_text = if weapon.attack_bonus.is_empty() {
+                                            format!("{} ({})", weapon.name, weapon.damage)
                                         } else {
-                                            format!("{}", weapon.modifier)
+                                            format!("{} {} — {}", weapon.name, weapon.attack_bonus, weapon.damage)
                                         };
-                                        let weapon_text = format!("{} - {} ({})", weapon.name, weapon.damage, modifier_str);
                                         
                                         let text_color = if is_current {
                                             egui::Color32::from_rgb(200, 255, 200)
@@ -3735,6 +3748,52 @@ impl eframe::App for IntImDnDApp {
                                     }
                                 }
                                 
+                                // Cantrips section
+                                if !config.cantrips.is_empty() {
+                                    y_offset += line_height * 0.3;
+                                    ui.painter().text(
+                                        egui::pos2(panel_rect.min.x + padding, y_offset),
+                                        egui::Align2::LEFT_TOP,
+                                        "Cantrips:",
+                                        egui::FontId::proportional(line_height * 0.75),
+                                        egui::Color32::from_rgb(150, 200, 255),
+                                    );
+                                    y_offset += line_height * 0.85;
+                                    for cantrip in &config.cantrips {
+                                        ui.painter().text(
+                                            egui::pos2(panel_rect.min.x + padding * 1.5, y_offset),
+                                            egui::Align2::LEFT_TOP,
+                                            &format!("✦ {}", cantrip),
+                                            egui::FontId::proportional(line_height * 0.68),
+                                            egui::Color32::from_rgb(180, 210, 255),
+                                        );
+                                        y_offset += line_height * 0.78;
+                                    }
+                                }
+
+                                // Spells section
+                                if !config.spells.is_empty() {
+                                    y_offset += line_height * 0.3;
+                                    ui.painter().text(
+                                        egui::pos2(panel_rect.min.x + padding, y_offset),
+                                        egui::Align2::LEFT_TOP,
+                                        "Spells:",
+                                        egui::FontId::proportional(line_height * 0.75),
+                                        egui::Color32::from_rgb(200, 150, 255),
+                                    );
+                                    y_offset += line_height * 0.85;
+                                    for spell in &config.spells {
+                                        ui.painter().text(
+                                            egui::pos2(panel_rect.min.x + padding * 1.5, y_offset),
+                                            egui::Align2::LEFT_TOP,
+                                            &format!("✦ {}", spell),
+                                            egui::FontId::proportional(line_height * 0.68),
+                                            egui::Color32::from_rgb(220, 180, 255),
+                                        );
+                                        y_offset += line_height * 0.78;
+                                    }
+                                }
+
                                 // Status indicator if dead
                                 if config.dead {
                                     ui.painter().text(

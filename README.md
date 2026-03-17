@@ -8,6 +8,7 @@ Attach any USB webcam to a projector to project an interactive Dungeons and Drag
 
 - **Hand Tracking**: Uses MediaPipe hand landmarks via Python subprocess
 - **Pinch Detection**: Detects thumb-index finger pinch gesture and allows moving characters
+- **Character Info Panel**: Hover over a token to see HP, AC, weapons, cantrips, and spells
 - **AI Image Generation**: Generate background images using Google Gemini API
 
 ## Prerequisites
@@ -67,15 +68,59 @@ Create `~/.config/intim-dnd/characters.yaml`:
 
 ```yaml
 characters:
-  - name: "Fighter"
-    class: "Fighter"
+  - name: "Aria Swiftblade"
+    class: "Fighter 3"
+    race: "Elf"
     armor_class: 16
-    hit_points: 45
-    health: 45
-    token_representation: "fighter.png"
-    weapons: []
-    current_weapon: "sword"
+    hit_points: 28
+    health: 28
+    token_representation: "aria.png"
+    weapons:
+      - name: "Longsword"
+        attack_bonus: "+5"
+        damage: "1d8+3 slashing"
+      - name: "Shortbow"
+        attack_bonus: "+4"
+        damage: "1d6+2 piercing"
+    current_weapon: "Longsword"
+
+  - name: "Zephyr the Wise"
+    class: "Wizard 2"
+    race: "Human"
+    armor_class: 12
+    hit_points: 14
+    health: 14
+    token_representation: "zephyr.png"
+    weapons:
+      - name: "Quarterstaff"
+        attack_bonus: "+2"
+        damage: "1d6 bludgeoning"
+    current_weapon: "Quarterstaff"
+    cantrips:
+      - "Fire Bolt — +4 to hit; 1d10 fire"
+      - "Prestidigitation — minor magical effects"
+    spells:
+      - "Magic Missile — auto-hit; 3x 1d4+1 force"
+      - "Shield — +5 AC reaction until next turn"
+
+enemies: []
 ```
+
+**`CharacterConfig` fields:**
+
+| Field | Required | Description |
+|---|---|---|
+| `name` | ✓ | Character name |
+| `class` | ✓ | Class and level (e.g. `"Rogue 1"`) |
+| `race` | | Race (displayed alongside class) |
+| `armor_class` | ✓ | AC value |
+| `hit_points` | ✓ | Maximum HP |
+| `health` | ✓ | Current HP (set equal to `hit_points` initially) |
+| `token_representation` | ✓ | Image filename in `token_reps/` |
+| `weapons` | | List of weapons with `name`, `attack_bonus`, `damage` |
+| `current_weapon` | | Name of the initially selected weapon |
+| `cantrips` | | List of cantrip description strings |
+| `spells` | | List of spell description strings |
 
 ## Usage
 
@@ -91,6 +136,17 @@ Open the Options window (View → Options Window) and use the Image Generation p
 ### Moving Characters
 
 Use a pinch gesture (thumb and index finger together) to pick up and move character tokens on the grid.
+
+### Character Info Panel
+
+Click a character token on the board to open its info panel. The panel shows:
+
+- Name, race, and class
+- Current HP / Max HP (colour-coded by health)
+- Armour Class
+- **Weapons** — hover over a weapon button for ~1 second to equip it; the active weapon is highlighted with a ✓
+- **Cantrips** — listed in blue
+- **Spells** — listed in purple
 
 ## Files
 
